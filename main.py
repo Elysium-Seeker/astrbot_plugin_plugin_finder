@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+from datetime import datetime
 import httpx
 from astrbot.api.all import Context, AstrMessageEvent
 from astrbot.api.event.filter import command, llm_tool
@@ -11,12 +12,13 @@ from astrbot.api.star import register, Star
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.0",
+    "1.1.1",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.market_api_url = "https://api.soulter.top/astrbot/plugins"
+        self._last_install_report = "尚无安装记录。"
 
         # 确定插件根目录
         current_plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,27 +26,61 @@ class PluginFinder(Star):
 
     async def _fetch_market_plugins(self) -> dict:
         """获取官方市场的全部插件数据"""
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(self.market_api_url)
-            if resp.status_code == 200:
-                return resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(self.market_api_url)
+                if resp.status_code == 200 and isinstance(resp.json(), dict):
+                    return resp.json()
+        except Exception:
+            return {}
         return {}
+
+    @staticmethod
+    def _normalize(name: str) -> str:
+        return (name or "").lower().replace("-", "").replace("_", "").replace(" ", "")
+
+    @staticmethod
+    def _shorten(text: str, limit: int = 600) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit] + " ...[输出过长已截断]"
+
+    async def _run_cmd(
+        self, *args: str, cwd: str | None = None
+    ) -> tuple[int, str, str]:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        out_text = stdout.decode("utf-8", errors="ignore")
+        err_text = stderr.decode("utf-8", errors="ignore")
+        return process.returncode, out_text, err_text
+
+    @staticmethod
+    def _parse_reload_result(result) -> tuple[bool, str]:
+        if isinstance(result, tuple) and len(result) >= 2:
+            return bool(result[0]), str(result[1])
+        return bool(result), ""
 
     @llm_tool(name="search_astrbot_plugin")
     async def search_plugin(self, event: AstrMessageEvent, search_keyword: str):
         """当用户想要查找、安装某种功能的插件时，使用此工具去官方市场搜索。
         根据返回的结果，向用户简单推荐最符合的一个或几个插件（包含其基本功能介绍）。
         请务必在回答的最后明确询问用户：“找到了这些插件，是否需要为您安装？”（请使用真实查询到的名称，不要自己编造）。
+        禁止在未调用 install_astrbot_plugin 前向用户声称“已经安装成功”。
         """
         plugins = await self._fetch_market_plugins()
         results = []
         for key, data in plugins.items():
-            desc = data.get("desc", "")
-            display_name = data.get("display_name", key)
+            desc = str(data.get("desc") or "")
+            display_name = str(data.get("display_name") or key)
             if (
                 search_keyword.lower() in desc.lower()
                 or search_keyword.lower() in display_name.lower()
-                or search_keyword.lower() in key.lower()
+                or search_keyword.lower() in str(key).lower()
             ):
                 results.append(
                     {
@@ -74,8 +110,16 @@ class PluginFinder(Star):
         【极其重要】：如果用户没有明确同意安装，必须将 has_user_confirmed 设置为 False！
         如果由于任何原因你不确定用户是否同意，也设为 False！
         """
+        report_lines = [
+            f"时间: {datetime.now().isoformat(timespec='seconds')}",
+            f"用户输入: {plugin_name}",
+            f"插件根目录: {self.plugins_root}",
+        ]
+
         if not has_user_confirmed:
-            return "执行已被拒绝：请先向用户询问'找到插件...，是否确认安装？'，等用户确认后再调用此工具并传入 true 参数。"
+            report_lines.append("用户未确认安装，流程终止。")
+            self._last_install_report = "\n".join(report_lines)
+            return "[INSTALL_BLOCKED] 执行已被拒绝：请先向用户询问并确认安装，再调用此工具。"
 
         # 执行耗时操作时可以先利用 yield 发送提示，但 llm_tool 中我们也可以借助于 event.send
         await event.send(
@@ -84,19 +128,21 @@ class PluginFinder(Star):
             )
         )
 
-        def _normalize(name: str) -> str:
-            return name.lower().replace("-", "").replace("_", "").replace(" ", "")
-
         # 1. 在市场中校验以获取正确的 repo 和 name
         plugins = await self._fetch_market_plugins()
+        if not plugins:
+            report_lines.append("市场 API 拉取失败或返回为空。")
+            self._last_install_report = "\n".join(report_lines)
+            return "[INSTALL_FAIL] 无法访问官方市场 API，请稍后重试。"
+
         target_data = None
         target_key = None
-        norm_plugin_name = _normalize(plugin_name)
+        norm_plugin_name = self._normalize(plugin_name)
 
         # 尝试精确匹配（无视连接符大小写）
         for key, data in plugins.items():
-            norm_key = _normalize(key)
-            norm_repo = _normalize(data.get("repo", "").split("/")[-1])
+            norm_key = self._normalize(key)
+            norm_repo = self._normalize(str(data.get("repo") or "").split("/")[-1])
             if norm_plugin_name == norm_key or norm_plugin_name == norm_repo:
                 target_data = data
                 target_key = key
@@ -105,8 +151,8 @@ class PluginFinder(Star):
         if not target_data:
             # 尝试宽松匹配
             for key, data in plugins.items():
-                norm_key = _normalize(key)
-                norm_display = _normalize(data.get("display_name", ""))
+                norm_key = self._normalize(key)
+                norm_display = self._normalize(str(data.get("display_name") or ""))
                 if (
                     norm_plugin_name in norm_key
                     or norm_plugin_name in norm_display
@@ -117,38 +163,79 @@ class PluginFinder(Star):
                     break
 
         if not target_data:
-            return f"安装失败：在市场中未找到名为 {plugin_name} 的合法插件，为保证安全已终止安装。"
+            report_lines.append("市场匹配失败。")
+            self._last_install_report = "\n".join(report_lines)
+            return f"[INSTALL_FAIL] 安装失败：在市场中未找到名为 {plugin_name} 的合法插件。"
 
-        repo_url = target_data["repo"]
+        repo_url = str(target_data.get("repo") or "").strip()
+        if not repo_url:
+            report_lines.append(f"匹配成功但 repo 为空，插件键: {target_key}")
+            self._last_install_report = "\n".join(report_lines)
+            return f"[INSTALL_FAIL] 安装失败：插件 {target_key} 缺少仓库地址。"
+
         if not repo_url.startswith("http"):
             repo_url = f"https://github.com/{repo_url}"
 
         repo_name = repo_url.rstrip("/").split("/")[-1]
         target_dir = os.path.join(self.plugins_root, repo_name)
+        report_lines.append(f"匹配插件键: {target_key}")
+        report_lines.append(f"仓库地址: {repo_url}")
+        report_lines.append(f"目标目录: {target_dir}")
 
-        # 2. Git Clone
-        # 为了不阻塞 LLM 太久，我们可以做简单的快速拉取
+        # 2. 先验证仓库可达，避免模型“说安装了但其实没执行”
+        await event.send(event.plain_result(f"🔎 验证仓库可达性: {repo_url}"))
+        code, out, err = await self._run_cmd("git", "ls-remote", repo_url)
+        report_lines.append(f"git ls-remote 返回码: {code}")
+        if code != 0:
+            report_lines.append(f"git ls-remote 错误: {self._shorten(err)}")
+            self._last_install_report = "\n".join(report_lines)
+            return f"[INSTALL_FAIL] 无法访问仓库地址，错误信息: {self._shorten(err)}"
+
+        # 3. Git Clone / Pull，严格检查返回码
         try:
             if os.path.exists(target_dir):
-                process = await asyncio.create_subprocess_exec(
+                await event.send(event.plain_result("📦 目录已存在，执行 git pull 更新..."))
+                code, out, err = await self._run_cmd(
                     "git", "pull", cwd=target_dir
                 )
-                await process.communicate()
+                report_lines.append(f"git pull 返回码: {code}")
+                if code != 0:
+                    report_lines.append(f"git pull 错误: {self._shorten(err)}")
+                    self._last_install_report = "\n".join(report_lines)
+                    return f"[INSTALL_FAIL] git pull 失败: {self._shorten(err)}"
             else:
-                process = await asyncio.create_subprocess_exec(
+                await event.send(event.plain_result("📥 目录不存在，执行 git clone..."))
+                code, out, err = await self._run_cmd(
                     "git", "clone", repo_url, target_dir
                 )
-                await process.communicate()
-                if process.returncode != 0:
-                    return "安装失败：Git Clone 失败，可能网络问题。"
+                report_lines.append(f"git clone 返回码: {code}")
+                if code != 0:
+                    report_lines.append(f"git clone 错误: {self._shorten(err)}")
+                    self._last_install_report = "\n".join(report_lines)
+                    return f"[INSTALL_FAIL] Git Clone 失败: {self._shorten(err)}"
         except Exception as e:
-            return f"安装中发生本地异常：{e}"
+            report_lines.append(f"Git 阶段异常: {e}")
+            self._last_install_report = "\n".join(report_lines)
+            return f"[INSTALL_FAIL] 安装中发生本地异常: {e}"
 
-        # 3. 安装依赖
+        # 4. 下载后二次校验，确保 WebUI 可发现
+        if not os.path.isdir(target_dir):
+            report_lines.append("目标目录不存在，疑似 clone 未实际落盘。")
+            self._last_install_report = "\n".join(report_lines)
+            return "[INSTALL_FAIL] 目录校验失败：仓库目录不存在。"
+
+        metadata_file = os.path.join(target_dir, "metadata.yaml")
+        report_lines.append(f"metadata.yaml 是否存在: {os.path.exists(metadata_file)}")
+        if not os.path.exists(metadata_file):
+            self._last_install_report = "\n".join(report_lines)
+            return "[INSTALL_FAIL] 插件目录缺少 metadata.yaml，WebUI 不会识别此目录为插件。"
+
+        # 5. 安装依赖，严格检查返回码
         req_file = os.path.join(target_dir, "requirements.txt")
         if os.path.exists(req_file):
             try:
-                process = await asyncio.create_subprocess_exec(
+                await event.send(event.plain_result("🧩 检测到 requirements.txt，执行 pip install..."))
+                code, out, err = await self._run_cmd(
                     sys.executable,
                     "-m",
                     "pip",
@@ -157,22 +244,81 @@ class PluginFinder(Star):
                     "requirements.txt",
                     cwd=target_dir,
                 )
-                await process.communicate()
-            except Exception:
-                pass
+                report_lines.append(f"pip install 返回码: {code}")
+                if code != 0:
+                    report_lines.append(f"pip install 错误: {self._shorten(err)}")
+                    self._last_install_report = "\n".join(report_lines)
+                    return f"[INSTALL_FAIL] 依赖安装失败: {self._shorten(err)}"
+            except Exception as e:
+                report_lines.append(f"pip 阶段异常: {e}")
+                self._last_install_report = "\n".join(report_lines)
+                return f"[INSTALL_FAIL] 依赖安装异常: {e}"
+        else:
+            report_lines.append("无 requirements.txt，跳过依赖安装。")
 
-        # 4. 热重载
+        # 6. 热重载：先定向重载，失败再全量重载
+        reload_success = False
+        reload_errors = []
         try:
             if hasattr(self.context, "_star_manager"):
-                success, err = await self.context._star_manager.reload(repo_name)
-                if success:
-                    return f"插件 {target_data.get('display_name', target_key)} 安装完全成功，并且已经通过热重载在后台生效了！请用友好的口吻向用户汇报这个好消息。"
-                else:
-                    return f"插件 {target_key} 已就绪，但热重载存在问题：{err}。可能部分功能受限，建议用户之后重启。"
+                await event.send(event.plain_result("🔄 正在刷新插件列表..."))
+                manager = self.context._star_manager
+
+                try:
+                    result = await manager.reload(repo_name)
+                    reload_success, reload_err = self._parse_reload_result(result)
+                    report_lines.append(f"reload({repo_name}) 结果: {result}")
+                    if not reload_success and reload_err:
+                        reload_errors.append(reload_err)
+                except Exception as e:
+                    reload_errors.append(f"reload({repo_name}) 异常: {e}")
+                    report_lines.append(f"reload({repo_name}) 异常: {e}")
+
+                if not reload_success:
+                    try:
+                        result = await manager.reload()
+                        reload_success, reload_err = self._parse_reload_result(result)
+                        report_lines.append(f"reload() 结果: {result}")
+                        if not reload_success and reload_err:
+                            reload_errors.append(reload_err)
+                    except Exception as e:
+                        reload_errors.append(f"reload() 异常: {e}")
+                        report_lines.append(f"reload() 异常: {e}")
+
+                if reload_success:
+                    report_lines.append("安装与热重载成功。")
+                    self._last_install_report = "\n".join(report_lines)
+                    return (
+                        "[INSTALL_OK] 已真实执行 git/pip 命令并完成热重载。"
+                        f"\n插件: {target_data.get('display_name', target_key)}"
+                        f"\n目录: {target_dir}"
+                        "\n如需审计明细，可发送 /查看安装日志"
+                    )
+
+                report_lines.append("安装完成但热重载失败。")
+                self._last_install_report = "\n".join(report_lines)
+                return (
+                    "[INSTALL_PARTIAL] 代码已下载，但热重载失败。"
+                    f"\n错误: {self._shorten('; '.join(reload_errors))}"
+                    "\n请手动执行 /plugin reload 后在 WebUI 查看。"
+                    "\n如需审计明细，可发送 /查看安装日志"
+                )
             else:
-                return "插件已安装完毕！但当前版本不支持静默热重载，请建议用户发送 /plugin reload 命令。"
+                report_lines.append("当前版本未暴露 _star_manager。")
+                self._last_install_report = "\n".join(report_lines)
+                return (
+                    "[INSTALL_PARTIAL] 代码已下载，但当前版本不支持静默热重载。"
+                    "\n请手动执行 /plugin reload 后在 WebUI 查看。"
+                )
         except Exception as e:
-            return f"安装成功，但应用刷新时出错了：{e}。"
+            report_lines.append(f"热重载阶段异常: {e}")
+            self._last_install_report = "\n".join(report_lines)
+            return f"[INSTALL_PARTIAL] 下载完成，但应用刷新时出错: {e}"
+
+    @command("查看安装日志")
+    async def show_install_log(self, event: AstrMessageEvent):
+        """查看最近一次安装流程的详细日志。"""
+        yield event.plain_result(self._shorten(self._last_install_report, limit=3800))
 
     @command("直接安装插件")
     async def cmd_direct_install(self, event: AstrMessageEvent, plugin_keyword: str):
