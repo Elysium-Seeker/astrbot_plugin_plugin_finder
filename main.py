@@ -70,7 +70,7 @@ class PluginFinder(Star):
         self, event: AstrMessageEvent, plugin_name: str, has_user_confirmed: bool
     ):
         """当用户明确同意安装某个特定的插件后（如：回答“是的”、“安装 xx”），调用此工具进行实际的下载和安装。
-        plugin_name 请提供在 search 工具中获得的完整插件名称或 repo_url（如果可以的话最好是完整的 astrbot_plugin_xxx 格式）。
+        plugin_name 请提供在 search 工具中获得的完整插件名称（如 astrbot-plugin-xxx）。
         【极其重要】：如果用户没有明确同意安装，必须将 has_user_confirmed 设置为 False！
         如果由于任何原因你不确定用户是否同意，也设为 False！
         """
@@ -84,15 +84,20 @@ class PluginFinder(Star):
             )
         )
 
+        def _normalize(name: str) -> str:
+            return name.lower().replace("-", "").replace("_", "").replace(" ", "")
+
         # 1. 在市场中校验以获取正确的 repo 和 name
         plugins = await self._fetch_market_plugins()
         target_data = None
         target_key = None
+        norm_plugin_name = _normalize(plugin_name)
+
+        # 尝试精确匹配（无视连接符大小写）
         for key, data in plugins.items():
-            if (
-                plugin_name.lower() == key.lower()
-                or plugin_name.lower() == data.get("repo", "").lower()
-            ):
+            norm_key = _normalize(key)
+            norm_repo = _normalize(data.get("repo", "").split("/")[-1])
+            if norm_plugin_name == norm_key or norm_plugin_name == norm_repo:
                 target_data = data
                 target_key = key
                 break
@@ -100,9 +105,12 @@ class PluginFinder(Star):
         if not target_data:
             # 尝试宽松匹配
             for key, data in plugins.items():
+                norm_key = _normalize(key)
+                norm_display = _normalize(data.get("display_name", ""))
                 if (
-                    plugin_name.lower() in key.lower()
-                    or plugin_name.lower() in data.get("display_name", "").lower()
+                    norm_plugin_name in norm_key
+                    or norm_plugin_name in norm_display
+                    or norm_key in norm_plugin_name
                 ):
                     target_data = data
                     target_key = key
