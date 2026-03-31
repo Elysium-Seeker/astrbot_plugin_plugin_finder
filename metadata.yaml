@@ -1,5 +1,23 @@
 name: astrbot_plugin_plugin_finder
 display_name: 插件发现者
-description: 在对话中自行查询、校验、下载并安装 AstrBot 官方平台插件。
-version: 1.1.1
+description: 在对话中查询、校验、下载并安装 AstrBot 官方平台插件，支持安装审计日志。
+desc: 在对话中查询、校验、下载并安装 AstrBot 官方平台插件，支持安装审计日志。
+version: 1.1.2
 author: Administrator
+repo: https://github.com/Elysium-Seeker/astrbot_plugin_plugin_finder
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - wecom
+  - lark
+  - dingtalk
+  - discord
+  - slack
+  - kook
+  - vocechat
+  - weixin_official_account
+  - satori
+  - misskey
+  - line

@@ -12,17 +12,67 @@ from astrbot.api.star import register, Star
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.1",
+    "1.1.2",
 )
 class PluginFinder(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config=None):
         super().__init__(context)
-        self.market_api_url = "https://api.soulter.top/astrbot/plugins"
+        self.plugin_config = config or {}
+        self.market_api_url = str(
+            self._cfg("market_api_url", "https://api.soulter.top/astrbot/plugins")
+        ).strip() or "https://api.soulter.top/astrbot/plugins"
+        self.git_bin = str(self._cfg("git_bin", "git")).strip() or "git"
+        self.pip_install_requirements = self._as_bool(
+            self._cfg("pip_install_requirements", True),
+            True,
+        )
+        self.auto_reload_after_install = self._as_bool(
+            self._cfg("auto_reload_after_install", True),
+            True,
+        )
+        self.full_reload_fallback = self._as_bool(
+            self._cfg("full_reload_fallback", True),
+            True,
+        )
+        self.recover_non_git_dir = self._as_bool(
+            self._cfg("recover_non_git_dir", True),
+            True,
+        )
+        self.git_timeout_sec = self._as_int(self._cfg("git_timeout_sec", 120), 120)
+        self.pip_timeout_sec = self._as_int(self._cfg("pip_timeout_sec", 600), 600)
         self._last_install_report = "尚无安装记录。"
 
         # 确定插件根目录
         current_plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.plugins_root = os.path.dirname(current_plugin_dir)
+
+    def _cfg(self, key: str, default):
+        try:
+            if isinstance(self.plugin_config, dict):
+                return self.plugin_config.get(key, default)
+            if hasattr(self.plugin_config, "get"):
+                return self.plugin_config.get(key, default)
+            return default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _as_bool(value, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    @staticmethod
+    def _as_int(value, default: int) -> int:
+        try:
+            parsed = int(value)
+            return parsed if parsed > 0 else default
+        except Exception:
+            return default
 
     async def _fetch_market_plugins(self) -> dict:
         """获取官方市场的全部插件数据"""
@@ -46,7 +96,10 @@ class PluginFinder(Star):
         return text[:limit] + " ...[输出过长已截断]"
 
     async def _run_cmd(
-        self, *args: str, cwd: str | None = None
+        self,
+        *args: str,
+        cwd: str | None = None,
+        timeout_sec: int | None = None,
     ) -> tuple[int, str, str]:
         process = await asyncio.create_subprocess_exec(
             *args,
@@ -54,7 +107,16 @@ class PluginFinder(Star):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        timeout_value = timeout_sec if timeout_sec is not None else self.git_timeout_sec
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout_value,
+            )
+        except TimeoutError:
+            process.kill()
+            await process.communicate()
+            return 124, "", f"命令超时({timeout_value}s): {' '.join(args)}"
         out_text = stdout.decode("utf-8", errors="ignore")
         err_text = stderr.decode("utf-8", errors="ignore")
         return process.returncode, out_text, err_text
@@ -114,6 +176,7 @@ class PluginFinder(Star):
             f"时间: {datetime.now().isoformat(timespec='seconds')}",
             f"用户输入: {plugin_name}",
             f"插件根目录: {self.plugins_root}",
+            f"配置: market_api_url={self.market_api_url}, git_bin={self.git_bin}",
         ]
 
         if not has_user_confirmed:
@@ -184,7 +247,12 @@ class PluginFinder(Star):
 
         # 2. 先验证仓库可达，避免模型“说安装了但其实没执行”
         await event.send(event.plain_result(f"🔎 验证仓库可达性: {repo_url}"))
-        code, out, err = await self._run_cmd("git", "ls-remote", repo_url)
+        code, out, err = await self._run_cmd(
+            self.git_bin,
+            "ls-remote",
+            repo_url,
+            timeout_sec=self.git_timeout_sec,
+        )
         report_lines.append(f"git ls-remote 返回码: {code}")
         if code != 0:
             report_lines.append(f"git ls-remote 错误: {self._shorten(err)}")
@@ -193,10 +261,33 @@ class PluginFinder(Star):
 
         # 3. Git Clone / Pull，严格检查返回码
         try:
+            if os.path.exists(target_dir) and not os.path.isdir(
+                os.path.join(target_dir, ".git")
+            ):
+                if self.recover_non_git_dir:
+                    backup_dir = (
+                        f"{target_dir}__backup_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    )
+                    os.rename(target_dir, backup_dir)
+                    report_lines.append(
+                        f"目标目录不是 git 仓库，已自动备份到: {backup_dir}"
+                    )
+                else:
+                    report_lines.append("目标目录存在但不是 git 仓库，且未启用自动恢复。")
+                    self._last_install_report = "\n".join(report_lines)
+                    return (
+                        "[INSTALL_FAIL] 目标目录存在但不是 Git 仓库，无法 pull。"
+                        "\n可在配置中开启 recover_non_git_dir 自动恢复。"
+                    )
+
             if os.path.exists(target_dir):
                 await event.send(event.plain_result("📦 目录已存在，执行 git pull 更新..."))
                 code, out, err = await self._run_cmd(
-                    "git", "pull", cwd=target_dir
+                    self.git_bin,
+                    "pull",
+                    cwd=target_dir,
+                    timeout_sec=self.git_timeout_sec,
                 )
                 report_lines.append(f"git pull 返回码: {code}")
                 if code != 0:
@@ -206,7 +297,11 @@ class PluginFinder(Star):
             else:
                 await event.send(event.plain_result("📥 目录不存在，执行 git clone..."))
                 code, out, err = await self._run_cmd(
-                    "git", "clone", repo_url, target_dir
+                    self.git_bin,
+                    "clone",
+                    repo_url,
+                    target_dir,
+                    timeout_sec=self.git_timeout_sec,
                 )
                 report_lines.append(f"git clone 返回码: {code}")
                 if code != 0:
@@ -232,7 +327,7 @@ class PluginFinder(Star):
 
         # 5. 安装依赖，严格检查返回码
         req_file = os.path.join(target_dir, "requirements.txt")
-        if os.path.exists(req_file):
+        if self.pip_install_requirements and os.path.exists(req_file):
             try:
                 await event.send(event.plain_result("🧩 检测到 requirements.txt，执行 pip install..."))
                 code, out, err = await self._run_cmd(
@@ -243,6 +338,7 @@ class PluginFinder(Star):
                     "-r",
                     "requirements.txt",
                     cwd=target_dir,
+                    timeout_sec=self.pip_timeout_sec,
                 )
                 report_lines.append(f"pip install 返回码: {code}")
                 if code != 0:
@@ -253,12 +349,23 @@ class PluginFinder(Star):
                 report_lines.append(f"pip 阶段异常: {e}")
                 self._last_install_report = "\n".join(report_lines)
                 return f"[INSTALL_FAIL] 依赖安装异常: {e}"
+        elif not self.pip_install_requirements:
+            report_lines.append("配置已关闭 pip_install_requirements，跳过依赖安装。")
         else:
             report_lines.append("无 requirements.txt，跳过依赖安装。")
 
         # 6. 热重载：先定向重载，失败再全量重载
         reload_success = False
         reload_errors = []
+        if not self.auto_reload_after_install:
+            report_lines.append("配置已关闭 auto_reload_after_install，跳过热重载。")
+            self._last_install_report = "\n".join(report_lines)
+            return (
+                "[INSTALL_PARTIAL] 代码已下载并可在重启后显示。"
+                "\n当前配置关闭了自动热重载，请手动执行 /plugin reload 或重启 AstrBot。"
+                "\n如需审计明细，可发送 /查看安装日志"
+            )
+
         try:
             if hasattr(self.context, "_star_manager"):
                 await event.send(event.plain_result("🔄 正在刷新插件列表..."))
@@ -274,7 +381,7 @@ class PluginFinder(Star):
                     reload_errors.append(f"reload({repo_name}) 异常: {e}")
                     report_lines.append(f"reload({repo_name}) 异常: {e}")
 
-                if not reload_success:
+                if not reload_success and self.full_reload_fallback:
                     try:
                         result = await manager.reload()
                         reload_success, reload_err = self._parse_reload_result(result)
@@ -284,6 +391,8 @@ class PluginFinder(Star):
                     except Exception as e:
                         reload_errors.append(f"reload() 异常: {e}")
                         report_lines.append(f"reload() 异常: {e}")
+                elif not reload_success:
+                    report_lines.append("已禁用 full_reload_fallback，跳过全量重载。")
 
                 if reload_success:
                     report_lines.append("安装与热重载成功。")
@@ -319,6 +428,21 @@ class PluginFinder(Star):
     async def show_install_log(self, event: AstrMessageEvent):
         """查看最近一次安装流程的详细日志。"""
         yield event.plain_result(self._shorten(self._last_install_report, limit=3800))
+
+    @command("查看插件配置")
+    async def show_plugin_config(self, event: AstrMessageEvent):
+        """查看当前插件运行时配置（来自 _conf_schema.json）。"""
+        info = (
+            f"market_api_url: {self.market_api_url}\n"
+            f"git_bin: {self.git_bin}\n"
+            f"git_timeout_sec: {self.git_timeout_sec}\n"
+            f"pip_install_requirements: {self.pip_install_requirements}\n"
+            f"pip_timeout_sec: {self.pip_timeout_sec}\n"
+            f"auto_reload_after_install: {self.auto_reload_after_install}\n"
+            f"full_reload_fallback: {self.full_reload_fallback}\n"
+            f"recover_non_git_dir: {self.recover_non_git_dir}"
+        )
+        yield event.plain_result(info)
 
     @command("直接安装插件")
     async def cmd_direct_install(self, event: AstrMessageEvent, plugin_keyword: str):
