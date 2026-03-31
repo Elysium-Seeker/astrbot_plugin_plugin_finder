@@ -1,118 +1,144 @@
 import os
 import sys
-import subprocess
 import asyncio
 import httpx
 from astrbot.api.all import Context, AstrMessageEvent
-from astrbot.api.event.filter import command
+from astrbot.api.event.filter import command, llm_tool
 from astrbot.api.star import register, Star
 
 
 @register(
     "astrbot_plugin_plugin_finder",
     "插件发现者",
-    "在对话中自行查询、校验、下载并安装 AstrBot 官方平台插件。",
-    "1.0.0",
+    "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
+    "1.1.0",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.market_api_url = "https://api.soulter.top/astrbot/plugins"
 
-        # 确定插件目录，通常是 data/plugins/
+        # 确定插件根目录
         current_plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.plugins_root = os.path.dirname(current_plugin_dir)
 
-    async def check_plugin_in_market(self, plugin_name: str) -> dict:
-        """检查插件是否存在于官方插件市场"""
+    async def _fetch_market_plugins(self) -> dict:
+        """获取官方市场的全部插件数据"""
         async with httpx.AsyncClient() as client:
             resp = await client.get(self.market_api_url)
             if resp.status_code == 200:
-                market_plugins = resp.json()
-                # market_API数据结构通常键是插件名如 "astrbot-plugin-DUT-Notices"
-                for key, data in market_plugins.items():
-                    # 匹配用户传入的名字，可能包含/不包含 'astrbot_plugin_' 前缀
-                    if (
-                        plugin_name.lower() in key.lower()
-                        or plugin_name.lower() in data.get("display_name", "").lower()
-                    ):
-                        if "repo" in data:
-                            return {
-                                "name": key,
-                                "repo": data["repo"],
-                                "display_name": data.get("display_name", key),
-                            }
+                return resp.json()
         return {}
 
-    @command("安装插件")
-    async def install_plugin(self, event: AstrMessageEvent, plugin_keyword: str):
+    @llm_tool(name="search_astrbot_plugin")
+    async def search_plugin(self, event: AstrMessageEvent, search_keyword: str):
+        """当用户想要查找、安装某种功能的插件时，使用此工具去官方市场搜索。
+        根据返回的结果，向用户简单推荐最符合的一个或几个插件（包含其基本功能介绍）。
+        请务必在回答的最后明确询问用户：“找到了这些插件，是否需要为您安装？”（请使用真实查询到的名称，不要自己编造）。
         """
-        安装指定的插件：/安装插件 <插件名或关键字>
-        """
-        yield event.plain_result(f"正在官方市场中搜索 [{plugin_keyword}] ...")
+        plugins = await self._fetch_market_plugins()
+        results = []
+        for key, data in plugins.items():
+            desc = data.get("desc", "")
+            display_name = data.get("display_name", key)
+            if (
+                search_keyword.lower() in desc.lower()
+                or search_keyword.lower() in display_name.lower()
+                or search_keyword.lower() in key.lower()
+            ):
+                results.append(
+                    {
+                        "plugin_name": key,
+                        "display_name": display_name,
+                        "description": desc,
+                        "repo_url": data.get("repo", ""),
+                    }
+                )
 
-        # 1. 自动校验是否在官方列表（安全白名单）
-        plugin_info = await self.check_plugin_in_market(plugin_keyword)
-        if not plugin_info:
-            yield event.plain_result(
-                f"⚠️ 在官方插件市场中未找到 `{plugin_keyword}`，为保障安全，已终止安装。"
+        if not results:
+            return f"未找到与 '{search_keyword}' 有关的插件。请告诉用户需要换个关键词试试。"
+
+        # 限制返回数量避免超出 token
+        results = results[:5]
+        return (
+            "找到了以下匹配的插件，请向用户推荐并明确询问'要安装其中哪个插件吗？'\n"
+            + str(results)
+        )
+
+    @llm_tool(name="install_astrbot_plugin")
+    async def install_plugin_tool(
+        self, event: AstrMessageEvent, plugin_name: str, has_user_confirmed: bool
+    ):
+        """当用户明确同意安装某个特定的插件后（如：回答“是的”、“安装 xx”），调用此工具进行实际的下载和安装。
+        plugin_name 请提供在 search 工具中获得的完整插件名称或 repo_url（如果可以的话最好是完整的 astrbot_plugin_xxx 格式）。
+        【极其重要】：如果用户没有明确同意安装，必须将 has_user_confirmed 设置为 False！
+        如果由于任何原因你不确定用户是否同意，也设为 False！
+        """
+        if not has_user_confirmed:
+            return "执行已被拒绝：请先向用户询问'找到插件...，是否确认安装？'，等用户确认后再调用此工具并传入 true 参数。"
+
+        # 执行耗时操作时可以先利用 yield 发送提示，但 llm_tool 中我们也可以借助于 event.send
+        await event.send(
+            event.plain_result(
+                f"⏳ 收到确认，开始为您安装插件：{plugin_name}，请稍候..."
             )
-            return
+        )
 
-        repo_url = plugin_info["repo"]
-        # 必须确保 repo URL 规范，比如转为 github
+        # 1. 在市场中校验以获取正确的 repo 和 name
+        plugins = await self._fetch_market_plugins()
+        target_data = None
+        target_key = None
+        for key, data in plugins.items():
+            if (
+                plugin_name.lower() == key.lower()
+                or plugin_name.lower() == data.get("repo", "").lower()
+            ):
+                target_data = data
+                target_key = key
+                break
+
+        if not target_data:
+            # 尝试宽松匹配
+            for key, data in plugins.items():
+                if (
+                    plugin_name.lower() in key.lower()
+                    or plugin_name.lower() in data.get("display_name", "").lower()
+                ):
+                    target_data = data
+                    target_key = key
+                    break
+
+        if not target_data:
+            return f"安装失败：在市场中未找到名为 {plugin_name} 的合法插件，为保证安全已终止安装。"
+
+        repo_url = target_data["repo"]
         if not repo_url.startswith("http"):
             repo_url = f"https://github.com/{repo_url}"
 
         repo_name = repo_url.rstrip("/").split("/")[-1]
         target_dir = os.path.join(self.plugins_root, repo_name)
 
-        yield event.plain_result(
-            f"✅ 找到官方插件：{plugin_info['display_name']} ({repo_name})\n正在执行下载..."
-        )
-
-        # 2. 自动下载 (使用 git)
+        # 2. Git Clone
+        # 为了不阻塞 LLM 太久，我们可以做简单的快速拉取
         try:
             if os.path.exists(target_dir):
-                yield event.plain_result(
-                    "发现已有同名文件夹，正在尝试更新(git pull)或重置..."
-                )
-                # 简单处理：如果已存在，让用户自行解决，或强制 pull
                 process = await asyncio.create_subprocess_exec(
-                    "git",
-                    "pull",
-                    cwd=target_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    "git", "pull", cwd=target_dir
                 )
                 await process.communicate()
             else:
                 process = await asyncio.create_subprocess_exec(
-                    "git",
-                    "clone",
-                    repo_url,
-                    target_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    "git", "clone", repo_url, target_dir
                 )
-                stdout, stderr = await process.communicate()
+                await process.communicate()
                 if process.returncode != 0:
-                    yield event.plain_result(
-                        f"❌ Git Clone 失败：\n{stderr.decode('utf-8', errors='ignore')}"
-                    )
-                    return
+                    return "安装失败：Git Clone 失败，可能网络问题。"
         except Exception as e:
-            yield event.plain_result(
-                f"❌ 源码下载环节发生错误: {str(e)}\n请确保宿主机已安装 Git。"
-            )
-            return
+            return f"安装中发生本地异常：{e}"
 
-        yield event.plain_result("📦 源码下载成功！正在检查依赖(requirements.txt)...")
-
-        # 3. 自动安装依赖
+        # 3. 安装依赖
         req_file = os.path.join(target_dir, "requirements.txt")
         if os.path.exists(req_file):
-            yield event.plain_result("检测到依赖文件，正在后台执行 pip install...")
             try:
                 process = await asyncio.create_subprocess_exec(
                     sys.executable,
@@ -122,43 +148,29 @@ class PluginFinder(Star):
                     "-r",
                     "requirements.txt",
                     cwd=target_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
                 )
-                stdout, stderr = await process.communicate()
-                if process.returncode != 0:
-                    yield event.plain_result(
-                        f"⚠️ 依赖安装出现错误，可能会影响插件运行：\n{stderr.decode('utf-8', errors='ignore')}"
-                    )
-                else:
-                    yield event.plain_result("✅ 依赖安装完成！")
-            except Exception as e:
-                yield event.plain_result(f"⚠️ 依赖自动安装异常：{str(e)}")
-        else:
-            yield event.plain_result("无需额外安装依赖。")
+                await process.communicate()
+            except Exception:
+                pass
 
-        # 4. 热重载生效
-        yield event.plain_result(
-            f"🎉 插件 {plugin_info['display_name']} 下载及依赖安装完毕！\n"
-            f"正在通过内部框架自动将其进行热重载并应用更改..."
-        )
-
-        # 使用最底层的星级管理器 (StarManager / PluginManager) 实现热重载，无需用户去执行命令。
+        # 4. 热重载
         try:
             if hasattr(self.context, "_star_manager"):
-                # 如果传入插件名，那么只重载该特定插件，如果不传则全部重载
                 success, err = await self.context._star_manager.reload(repo_name)
                 if success:
-                    yield event.plain_result("✅ 热重载触发成功！新插件现已生效。")
+                    return f"插件 {target_data.get('display_name', target_key)} 安装完全成功，并且已经通过热重载在后台生效了！请用友好的口吻向用户汇报这个好消息。"
                 else:
-                    yield event.plain_result(
-                        f"⚠️ 热重载触发完毕，但可能存在异常或该插件仍需全盘刷新：{err}"
-                    )
+                    return f"插件 {target_key} 已就绪，但热重载存在问题：{err}。可能部分功能受限，建议用户之后重启。"
             else:
-                yield event.plain_result(
-                    "⚠️ 当前版本似乎不支持后台静默重载，请发送 /plugin reload 使新插件生效。"
-                )
+                return "插件已安装完毕！但当前版本不支持静默热重载，请建议用户发送 /plugin reload 命令。"
         except Exception as e:
-            yield event.plain_result(
-                f"⚠️ 本地安全重载API调用发生内部错误: {e}\n请手动发送 /plugin reload"
-            )
+            return f"安装成功，但应用刷新时出错了：{e}。"
+
+    @command("直接安装插件")
+    async def cmd_direct_install(self, event: AstrMessageEvent, plugin_keyword: str):
+        """
+        通过命令直接强制安装：/直接安装插件 <插件名>
+        """
+        yield event.plain_result(f"执行直接安装命令: {plugin_keyword}...")
+        result = await self.install_plugin_tool(event, plugin_keyword, True)
+        yield event.plain_result(result)
