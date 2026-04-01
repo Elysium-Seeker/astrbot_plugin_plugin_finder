@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -62,16 +63,61 @@ def _as_bool(value, default: bool) -> bool:
 
 
 def _as_int(value, default: int) -> int:
+    return _as_int_with_limit(value, default)
+
+
+def _as_int_with_limit(
+    value,
+    default: int,
+    *,
+    key_name: str = "int",
+    min_value: int = 1,
+    max_value: int | None = None,
+) -> int:
     if isinstance(value, bool):
         logger.warning(f"整数配置不接受布尔值 value={value}，已回退默认值 {default}")
         return default
 
     try:
         parsed = int(value)
-        return parsed if parsed > 0 else default
+        if parsed < min_value:
+            logger.warning(
+                f"整数配置 {key_name} 不能小于 {min_value}，"
+                f"value={value}，已回退默认值 {default}"
+            )
+            return default
+
+        if max_value is not None and parsed > max_value:
+            logger.warning(
+                f"整数配置 {key_name} 超过上限 {max_value}，"
+                f"value={value}，已自动收敛到 {max_value}"
+            )
+            return max_value
+
+        return parsed
     except Exception as e:
         logger.warning(f"整数配置解析失败 value={value}: {e}")
         return default
+
+
+def _sanitize_git_bin(raw_value, default_value: str = "git") -> str:
+    raw = str(raw_value).strip() if raw_value is not None else ""
+    if not raw:
+        return default_value
+
+    if raw.lower() in {"git", "git.exe"}:
+        return raw
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    executable_name = os.path.basename(expanded).strip().lower()
+    if executable_name in {"git", "git.exe"}:
+        return expanded
+
+    logger.warning(
+        f"git_bin 配置不安全或无效 value={raw}，"
+        f"已回退默认值 {default_value}"
+    )
+    return default_value
 
 
 def _parse_host_allowlist(value, fallback_hosts: set[str] | None = None) -> set[str]:
@@ -175,17 +221,28 @@ def load_plugin_finder_config(plugin_config) -> PluginFinderConfig:
         default_market_api_url,
     )
 
-    git_bin = str(_cfg(plugin_config, "git_bin", "git")).strip() or "git"
+    git_bin = _sanitize_git_bin(_cfg(plugin_config, "git_bin", "git"), "git")
 
     direct_install_confirm_phrase = str(
-        _cfg(plugin_config, "direct_install_confirm_phrase", "确认安装")
-    ).strip() or "确认安装"
+        _cfg(plugin_config, "direct_install_confirm_phrase", "")
+    ).strip()
+
+    if not direct_install_confirm_phrase:
+        logger.warning(
+            "direct_install_confirm_phrase 为空，直接安装命令将保持禁用状态。"
+        )
 
     return PluginFinderConfig(
         market_api_url=market_api_url,
         allowed_market_api_hosts=allowed_market_api_hosts,
         git_bin=git_bin,
-        git_timeout_sec=_as_int(_cfg(plugin_config, "git_timeout_sec", 120), 120),
+        git_timeout_sec=_as_int_with_limit(
+            _cfg(plugin_config, "git_timeout_sec", 120),
+            120,
+            key_name="git_timeout_sec",
+            min_value=1,
+            max_value=600,
+        ),
         pip_install_requirements=_as_bool(
             _cfg(plugin_config, "pip_install_requirements", False),
             False,
@@ -193,7 +250,13 @@ def load_plugin_finder_config(plugin_config) -> PluginFinderConfig:
         trusted_requirements_plugins=_parse_plugin_allowlist(
             _cfg(plugin_config, "trusted_requirements_plugins", "")
         ),
-        pip_timeout_sec=_as_int(_cfg(plugin_config, "pip_timeout_sec", 600), 600),
+        pip_timeout_sec=_as_int_with_limit(
+            _cfg(plugin_config, "pip_timeout_sec", 600),
+            600,
+            key_name="pip_timeout_sec",
+            min_value=1,
+            max_value=1800,
+        ),
         auto_reload_after_install=_as_bool(
             _cfg(plugin_config, "auto_reload_after_install", True),
             True,

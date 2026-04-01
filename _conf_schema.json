@@ -15,13 +15,13 @@
     "description": "Git 可执行文件名或路径",
     "type": "string",
     "default": "git",
-    "hint": "Windows 可填写 git.exe 的绝对路径。"
+    "hint": "仅支持 git / git.exe 或以 git(.exe) 结尾的绝对路径。"
   },
   "git_timeout_sec": {
     "description": "Git 命令超时秒数",
     "type": "int",
     "default": 120,
-    "hint": "用于 ls-remote / clone / pull。"
+    "hint": "用于 ls-remote / clone / pull；有效范围 1-600，超过上限会自动收敛。"
   },
   "pip_install_requirements": {
     "description": "是否自动安装 requirements.txt",
@@ -38,7 +38,8 @@
   "pip_timeout_sec": {
     "description": "pip install 超时秒数",
     "type": "int",
-    "default": 600
+    "default": 600,
+    "hint": "有效范围 1-1800，超过上限会自动收敛。"
   },
   "auto_reload_after_install": {
     "description": "安装完成后是否自动热重载",
@@ -66,7 +67,7 @@
   "direct_install_confirm_phrase": {
     "description": "直接安装命令确认词",
     "type": "string",
-    "default": "确认安装",
-    "hint": "执行 /直接安装插件 时必须提供该确认词，防止误触发。"
+    "default": "",
+    "hint": "建议设置高强度随机短语；为空时 /直接安装插件 命令保持禁用。"
   }
 }

@@ -54,6 +54,7 @@ class PluginFinderService:
         return self._shorten(self._last_install_report, limit=limit)
 
     def format_runtime_config(self) -> str:
+        confirm_phrase_state = "(已设置)" if self.config.direct_install_confirm_phrase else "(未设置，直接安装命令禁用)"
         return (
             f"market_api_url: {self.config.market_api_url}\n"
             f"allowed_market_api_hosts: {', '.join(sorted(self.config.allowed_market_api_hosts))}\n"
@@ -66,7 +67,7 @@ class PluginFinderService:
             f"full_reload_fallback: {self.config.full_reload_fallback}\n"
             f"recover_non_git_dir: {self.config.recover_non_git_dir}\n"
             f"allowed_repo_hosts: {', '.join(sorted(self.config.allowed_repo_hosts))}\n"
-            f"direct_install_confirm_phrase: {self.config.direct_install_confirm_phrase}"
+            f"direct_install_confirm_phrase: {confirm_phrase_state}"
         )
 
     @staticmethod
@@ -97,6 +98,8 @@ class PluginFinderService:
                 if isinstance(data, dict):
                     return data
                 logger.warning("市场 API 返回的 JSON 不是对象类型。")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(f"拉取市场插件失败: {e}")
             return {}
@@ -142,6 +145,8 @@ class PluginFinderService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+        except asyncio.CancelledError:
+            raise
         except FileNotFoundError:
             command_name = args[0] if args else ""
             logger.error(f"命令不可用: {command_name}")
@@ -534,6 +539,8 @@ class PluginFinderService:
                 if code != 0:
                     report_lines.append(f"git clone 错误: {self._shorten(err)}")
                     return f"[INSTALL_FAIL] Git Clone 失败: {self._shorten(err)}"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(f"Git 阶段异常: {e}")
             report_lines.append(f"Git 阶段异常: {e}")
@@ -564,6 +571,31 @@ class PluginFinderService:
         plugin_key: str,
         report_lines: list[str],
     ) -> str | None:
+        def _scan_requirements_for_policy(path: str) -> tuple[bool, list[str]]:
+            pinned_requirement_pattern = re.compile(
+                r"^[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[^\s;]+(?:\s*;\s*.+)?$"
+            )
+            violations: list[str] = []
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        lowered = line.lower()
+                        if line.startswith("-"):
+                            violations.append(line)
+                            continue
+                        if " @ " in line or lowered.startswith("git+") or "://" in lowered:
+                            violations.append(line)
+                            continue
+                        if not pinned_requirement_pattern.fullmatch(line):
+                            violations.append(line)
+            except OSError as e:
+                return False, [f"读取 requirements.txt 失败: {e}"]
+
+            return len(violations) == 0, violations[:5]
+
         req_file = os.path.join(target_dir, "requirements.txt")
         if self.config.pip_install_requirements and os.path.exists(req_file):
             if plugin_key not in self.config.trusted_requirements_plugins:
@@ -574,6 +606,18 @@ class PluginFinderService:
                     "[INSTALL_PARTIAL] 已下载插件代码，但出于供应链安全考虑，"
                     "该插件不在依赖自动安装白名单，已跳过 pip install。"
                     "\n请人工确认后手动安装依赖，并执行 /plugin reload。"
+                )
+
+            requirements_safe, violations = _scan_requirements_for_policy(req_file)
+            if not requirements_safe:
+                report_lines.append(
+                    "requirements.txt 未通过安全策略校验: "
+                    f"{'; '.join(violations)}"
+                )
+                return (
+                    "[INSTALL_PARTIAL] 已下载插件代码，但 requirements.txt 未通过自动安装安全策略。"
+                    "\n当前仅允许固定版本(==)依赖，并禁止 URL/本地路径/额外 index 参数。"
+                    "\n请人工审计依赖后手动安装，并执行 /plugin reload。"
                 )
 
             try:
@@ -597,6 +641,8 @@ class PluginFinderService:
                 if code != 0:
                     report_lines.append(f"pip install 错误: {self._shorten(err)}")
                     return f"[INSTALL_FAIL] 依赖安装失败: {self._shorten(err)}"
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning(f"pip 阶段异常: {e}")
                 report_lines.append(f"pip 阶段异常: {e}")
@@ -648,6 +694,8 @@ class PluginFinderService:
                     report_lines.append(f"reload({repo_name}) 结果: {result}")
                     if not reload_success and reload_err:
                         reload_errors.append(reload_err)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logger.warning(f"定向热重载异常 repo={repo_name}: {e}")
                     reload_errors.append(f"reload({repo_name}) 异常: {e}")
@@ -660,6 +708,8 @@ class PluginFinderService:
                         report_lines.append(f"reload() 结果: {result}")
                         if not reload_success and reload_err:
                             reload_errors.append(reload_err)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
                         logger.warning(f"全量热重载异常: {e}")
                         reload_errors.append(f"reload() 异常: {e}")
@@ -692,6 +742,8 @@ class PluginFinderService:
                 "[INSTALL_PARTIAL] 代码已下载，但当前版本未找到可用的公开重载管理器。"
                 "\n请手动执行 /plugin reload 后在 WebUI 查看。",
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(f"热重载阶段异常: {e}")
             report_lines.append(f"热重载阶段异常: {e}")
@@ -710,30 +762,17 @@ class PluginFinderService:
         if not plugin_name:
             return "[INSTALL_FAIL] 插件名为空，请提供 search 返回的完整 plugin_name。"
 
-        if self._install_lock.locked():
-            await event.send(
-                event.plain_result("⏳ 当前有其他安装任务执行中，已加入队列，请稍候..."),
+        if not has_user_confirmed:
+            report_lines = [
+                f"时间: {datetime.now().isoformat(timespec='seconds')}",
+                f"用户输入: {plugin_name}",
+                "用户未确认安装，流程终止。",
+            ]
+            return self._save_and_return(
+                report_lines,
+                "[INSTALL_BLOCKED] 执行已被拒绝：请先向用户询问并确认安装，再调用此工具。",
             )
 
-        async with self._install_lock:
-            if not has_user_confirmed:
-                report_lines = [
-                    f"时间: {datetime.now().isoformat(timespec='seconds')}",
-                    f"用户输入: {plugin_name}",
-                    "用户未确认安装，流程终止。",
-                ]
-                return self._save_and_return(
-                    report_lines,
-                    "[INSTALL_BLOCKED] 执行已被拒绝：请先向用户询问并确认安装，再调用此工具。",
-                )
-
-            return await self._install_plugin_tool_locked(event, plugin_name)
-
-    async def _install_plugin_tool_locked(
-        self,
-        event: AstrMessageEvent,
-        plugin_name: str,
-    ) -> str:
         report_lines = self._new_install_report(plugin_name)
 
         await event.send(
@@ -758,27 +797,48 @@ class PluginFinderService:
         if error:
             return self._save_and_return(report_lines, error)
 
+        if (
+            target_key is None
+            or target_data is None
+            or repo_url is None
+            or repo_name is None
+            or target_dir is None
+        ):
+            report_lines.append("内部状态异常：安装目标解析结果不完整。")
+            return self._save_and_return(
+                report_lines,
+                "[INSTALL_FAIL] 安装目标解析异常，请稍后重试。",
+            )
+
         error = await self._verify_repo_reachable(event, repo_url, report_lines)
         if error:
             return self._save_and_return(report_lines, error)
 
-        error = await self._sync_plugin_repo(event, repo_url, target_dir, report_lines)
-        if error:
-            return self._save_and_return(report_lines, error)
+        if self._install_lock.locked():
+            await event.send(
+                event.plain_result("⏳ 当前有其他安装任务执行中，等待进入安装阶段..."),
+            )
 
-        error = self._verify_plugin_structure(target_dir, report_lines)
-        if error:
-            return self._save_and_return(report_lines, error)
+        async with self._install_lock:
+            report_lines.append("已进入安装互斥区：执行 clone/pull、依赖安装和热重载。")
 
-        error = await self._install_plugin_requirements(event, target_dir, target_key, report_lines)
-        if error:
-            return self._save_and_return(report_lines, error)
+            error = await self._sync_plugin_repo(event, repo_url, target_dir, report_lines)
+            if error:
+                return self._save_and_return(report_lines, error)
 
-        return await self._reload_after_install(
-            event,
-            repo_name,
-            target_dir,
-            target_key,
-            target_data,
-            report_lines,
-        )
+            error = self._verify_plugin_structure(target_dir, report_lines)
+            if error:
+                return self._save_and_return(report_lines, error)
+
+            error = await self._install_plugin_requirements(event, target_dir, target_key, report_lines)
+            if error:
+                return self._save_and_return(report_lines, error)
+
+            return await self._reload_after_install(
+                event,
+                repo_name,
+                target_dir,
+                target_key,
+                target_data,
+                report_lines,
+            )

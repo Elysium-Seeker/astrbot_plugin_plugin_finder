@@ -1,5 +1,6 @@
 ﻿import json
 import os
+import asyncio
 
 from astrbot.api import logger
 from astrbot.api.all import Context, AstrMessageEvent
@@ -18,7 +19,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.9",
+    "1.1.10",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -63,6 +64,8 @@ class PluginFinder(Star):
                 return f"未找到与 '{search_keyword}' 有关的插件。请告诉用户需要换个关键词试试。"
 
             return self._format_search_results(results)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"search_plugin 执行失败: {e}")
             return "[SEARCH_FAIL] 检索插件时发生异常，请稍后重试。"
@@ -85,6 +88,8 @@ class PluginFinder(Star):
                 plugin_name=plugin_name,
                 has_user_confirmed=has_user_confirmed,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"install_plugin_tool 执行失败: {e}")
             return "[INSTALL_FAIL] 安装流程执行异常，请稍后重试。"
@@ -94,11 +99,13 @@ class PluginFinder(Star):
         """查看最近一次安装流程的详细日志。"""
         yield event.plain_result(self.service.get_last_install_report(limit=3800))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查看插件配置")
     async def show_plugin_config(self, event: AstrMessageEvent):
         """查看当前插件运行时配置（来自 _conf_schema.json）。"""
         yield event.plain_result(self.service.format_runtime_config())
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("直接安装插件")
     async def cmd_direct_install(
         self,
@@ -114,10 +121,17 @@ class PluginFinder(Star):
             yield event.plain_result("请输入有效插件名，例如：/直接安装插件 astrbot_plugin_weather 确认安装")
             return
 
+        if not self.config.direct_install_confirm_phrase:
+            yield event.plain_result(
+                "直接安装命令当前已禁用。"
+                "\n请先在插件配置中设置 direct_install_confirm_phrase（建议使用高强度随机短语）。"
+            )
+            return
+
         if confirm_phrase.strip() != self.config.direct_install_confirm_phrase:
             yield event.plain_result(
-                "为避免误触发，请补充确认词。"
-                f"\n示例：/直接安装插件 {plugin_keyword} {self.config.direct_install_confirm_phrase}"
+                "确认词不正确，已拒绝执行高风险安装命令。"
+                "\n请检查 direct_install_confirm_phrase 配置后重试。"
             )
             return
 
@@ -125,6 +139,8 @@ class PluginFinder(Star):
         try:
             result = await self.service.install_plugin_tool(event, plugin_keyword, True)
             yield event.plain_result(result)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"cmd_direct_install 执行失败: {e}")
             yield event.plain_result("[INSTALL_FAIL] 直接安装流程异常，请稍后重试。")
