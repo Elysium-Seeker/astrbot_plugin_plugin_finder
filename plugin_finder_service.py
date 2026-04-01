@@ -45,7 +45,7 @@ class PluginFinderService:
         return (name or "").lower().replace("-", "").replace("_", "").replace(" ", "")
 
     @staticmethod
-    def _shorten(text: str, limit: int = 600) -> str:
+    def _shorten(text: str, limit: int = 360) -> str:
         if len(text) <= limit:
             return text
         return text[:limit] + " ...[输出过长已截断]"
@@ -58,7 +58,7 @@ class PluginFinderService:
         self._last_install_report = self._save_report(report_lines)
         return message
 
-    def get_last_install_report(self, limit: int = 3800) -> str:
+    def get_last_install_report(self, limit: int = 2400) -> str:
         return self._shorten(self._last_install_report, limit=limit)
 
     def format_runtime_config(self) -> str:

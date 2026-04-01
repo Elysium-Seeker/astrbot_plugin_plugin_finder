@@ -19,7 +19,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.15",
+    "1.1.16",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -35,21 +35,34 @@ class PluginFinder(Star):
         )
 
     @staticmethod
+    def _compact_text(value: str, limit: int) -> str:
+        text = (value or "").strip()
+        if len(text) <= limit:
+            return text
+        if limit <= 3:
+            return text[:limit]
+        return text[: limit - 3] + "..."
+
+    @staticmethod
     def _format_search_results(results: list[dict]) -> str:
+        compact_items = []
+        for item in results[:3]:
+            compact_items.append(
+                {
+                    "plugin_name": str(item.get("plugin_name", "")).strip(),
+                    "display_name": str(item.get("display_name", "")).strip(),
+                    "description": PluginFinder._compact_text(
+                        str(item.get("description", "")),
+                        100,
+                    ),
+                }
+            )
+
         payload = {
             "total": len(results),
-            "items": [
-                {
-                    "plugin_name": item.get("plugin_name", ""),
-                    "display_name": item.get("display_name", ""),
-                    "description": item.get("description", ""),
-                    "repo_url": item.get("repo_url", ""),
-                }
-                for item in results
-            ],
-            "next_step": "请结合上面候选向用户推荐，并明确询问‘是否需要我现在安装其中某个插件？’",
+            "items": compact_items,
         }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def _pick_first_non_empty(mapping: dict, candidate_keys: tuple[str, ...]) -> str:
@@ -88,14 +101,7 @@ class PluginFinder(Star):
         search_keyword: str = "",
         **kwargs,
     ):
-        """当用户想要查找、安装某种功能的插件时，使用此工具去官方市场搜索。
-        根据返回的结果，向用户简单推荐最符合的一个或几个插件（包含其基本功能介绍）。
-        请务必在回答的最后明确询问用户：“找到了这些插件，是否需要为您安装？”（请使用真实查询到的名称，不要自己编造）。
-        禁止在未调用 install_astrbot_plugin 前向用户声称“已经安装成功”。
-
-        Args:
-            search_keyword (str): 搜索关键词，可为功能词或插件名。
-        """
+        """搜索官方市场插件，返回精简候选列表。"""
         try:
             if not (search_keyword or "").strip() and kwargs:
                 search_keyword = self._pick_first_non_empty(
@@ -125,15 +131,7 @@ class PluginFinder(Star):
         has_user_confirmed=False,
         **kwargs,
     ):
-        """当用户明确同意安装某个特定的插件后（如：回答“是的”、“安装 xx”），调用此工具进行实际的下载和安装。
-        plugin_name 请提供在 search 工具中获得的完整插件名称（如 astrbot-plugin-xxx）。
-        【极其重要】：如果用户没有明确同意安装，必须将 has_user_confirmed 设置为 False！
-        如果由于任何原因你不确定用户是否同意，也设为 False！
-
-        Args:
-            plugin_name (str): 目标插件名称，建议传 search 返回的完整 plugin_name。
-            has_user_confirmed (bool): 用户是否已明确确认安装。
-        """
+        """用户明确确认后执行安装；未确认时 has_user_confirmed 必须为 False。"""
         try:
             if not (plugin_name or "").strip() and kwargs:
                 plugin_name = self._pick_first_non_empty(
@@ -177,7 +175,7 @@ class PluginFinder(Star):
     @filter.command("查看安装日志")
     async def show_install_log(self, event: AstrMessageEvent):
         """查看最近一次安装流程的详细日志。"""
-        yield event.plain_result(self.service.get_last_install_report(limit=3800))
+        yield event.plain_result(self.service.get_last_install_report(limit=2400))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查看插件配置")

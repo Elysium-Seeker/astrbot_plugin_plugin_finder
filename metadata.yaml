@@ -1,7 +1,7 @@
 name: astrbot_plugin_plugin_finder
 display_name: 发现并安装插件
 desc: 在对话中查询、校验、下载并安装 AstrBot 官方平台插件，支持安装审计日志。
-version: 1.1.15
+version: 1.1.16
 author: Elysium-Seeker
 repo: https://github.com/Elysium-Seeker/astrbot_plugin_plugin_finder
 astrbot_version: ">=4.16,<5"
