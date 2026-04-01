@@ -13,6 +13,7 @@
 
 ## 🆕 最近更新
 
+- `v1.1.14`：增强“已安装跳过”检测：不再只依赖仓库名目录，改为扫描插件根目录下各插件的 `metadata.yaml` 的 `name` 字段进行识别，避免“目录名不一致导致重复 clone”。
 - `v1.1.13`：新增“已安装跳过”机制：目标插件目录已存在且包含 `metadata.yaml` 时，不再重复执行 clone/pull/pip，直接返回 `[INSTALL_SKIPPED]`。
 - `v1.1.12`：针对 `install_astrbot_plugin` 60 秒超时优化：移除安装前重复的 `git ls-remote` 探测、`git clone` 改为浅克隆（`--depth 1 --single-branch --no-tags`）、安装锁占用时改为快速失败并提示重试（避免排队超时）。
 - `v1.1.11`：修复自动安装工具 `handler parameter mismatch`：补齐 llm_tool 标准 Args 参数定义，安装与搜索工具改为缺参/别名参数兼容解析（避免模型侧参数名偏差导致调用失败）。

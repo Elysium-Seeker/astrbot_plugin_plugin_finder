@@ -350,6 +350,59 @@ class PluginFinderService:
             f"配置: market_api_url={self.config.market_api_url}, git_bin={self.config.git_bin}",
         ]
 
+    @staticmethod
+    def _read_metadata_name(metadata_file: str) -> str | None:
+        try:
+            with open(metadata_file, "r", encoding="utf-8", errors="ignore") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if not line.lower().startswith("name:"):
+                        continue
+
+                    value = line.split(":", 1)[1].strip()
+                    if not value:
+                        return None
+
+                    # Strip optional quotes for common YAML one-line scalar style.
+                    if (value.startswith("\"") and value.endswith("\"")) or (
+                        value.startswith("'") and value.endswith("'")
+                    ):
+                        value = value[1:-1].strip()
+                    return value or None
+        except OSError:
+            return None
+
+        return None
+
+    def _find_installed_plugin_dir_by_name(self, plugin_key: str) -> str | None:
+        plugin_key_norm = self._normalize(plugin_key)
+        if not plugin_key_norm:
+            return None
+
+        plugins_root_abs = os.path.abspath(self.plugins_root)
+        if not os.path.isdir(plugins_root_abs):
+            return None
+
+        try:
+            for entry in os.scandir(plugins_root_abs):
+                if not entry.is_dir():
+                    continue
+
+                metadata_file = os.path.join(entry.path, "metadata.yaml")
+                if not os.path.exists(metadata_file):
+                    continue
+
+                installed_name = self._read_metadata_name(metadata_file)
+                if installed_name and self._normalize(installed_name) == plugin_key_norm:
+                    return os.path.abspath(entry.path)
+        except OSError as e:
+            logger.warning(f"扫描已安装插件目录失败: {e}")
+            return None
+
+        return None
+
     def _resolve_install_target(
         self,
         plugins: dict,
@@ -825,19 +878,27 @@ class PluginFinderService:
         async with self._install_lock:
             report_lines.append("已进入安装互斥区：执行 clone/pull、依赖安装和热重载。")
 
-            metadata_file = os.path.join(target_dir, "metadata.yaml")
-            if os.path.isdir(target_dir) and os.path.exists(metadata_file):
-                if os.path.isdir(os.path.join(target_dir, ".git")):
-                    origin_error = await self._verify_git_origin(target_dir, repo_url, report_lines)
+            installed_dir = self._find_installed_plugin_dir_by_name(target_key)
+            if installed_dir:
+                report_lines.append(f"按 metadata.name 检测到已安装插件目录: {installed_dir}")
+
+                if os.path.isdir(os.path.join(installed_dir, ".git")):
+                    origin_error = await self._verify_git_origin(installed_dir, repo_url, report_lines)
                     if origin_error:
                         return self._save_and_return(report_lines, origin_error)
 
-                report_lines.append("检测到插件目录已存在且包含 metadata.yaml，已跳过重复安装。")
+                if os.path.abspath(installed_dir) != os.path.abspath(target_dir):
+                    report_lines.append(
+                        "已安装目录与仓库名推导目录不一致，已按 metadata.name 判定为已安装。"
+                        f" expected_target={target_dir}, detected_installed={installed_dir}"
+                    )
+
+                report_lines.append("检测到插件已安装，已跳过重复安装。")
                 return self._save_and_return(
                     report_lines,
                     "[INSTALL_SKIPPED] 检测到该插件已安装，已跳过重复安装。"
                     f"\n插件: {target_data.get('display_name', target_key)}"
-                    f"\n目录: {target_dir}"
+                    f"\n目录: {installed_dir}"
                     "\n如需刷新加载状态，请手动执行 /plugin reload。",
                 )
 
