@@ -19,7 +19,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.10",
+    "1.1.11",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -51,14 +51,61 @@ class PluginFinder(Star):
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+    @staticmethod
+    def _pick_first_non_empty(mapping: dict, candidate_keys: tuple[str, ...]) -> str:
+        for key in candidate_keys:
+            value = mapping.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _as_confirmed_flag(value) -> bool:
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, (int, float)):
+            if value in {0, 1}:
+                return bool(value)
+            return False
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "ok", "confirm", "已确认", "确认", "是", "好的"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "否", "未确认", "取消"}:
+                return False
+
+        return False
+
     @filter.llm_tool(name="search_astrbot_plugin")
-    async def search_plugin(self, event: AstrMessageEvent, search_keyword: str):
+    async def search_plugin(
+        self,
+        event: AstrMessageEvent,
+        search_keyword: str = "",
+        **kwargs,
+    ):
         """当用户想要查找、安装某种功能的插件时，使用此工具去官方市场搜索。
         根据返回的结果，向用户简单推荐最符合的一个或几个插件（包含其基本功能介绍）。
         请务必在回答的最后明确询问用户：“找到了这些插件，是否需要为您安装？”（请使用真实查询到的名称，不要自己编造）。
         禁止在未调用 install_astrbot_plugin 前向用户声称“已经安装成功”。
+
+        Args:
+            search_keyword (str): 搜索关键词，可为功能词或插件名。
         """
         try:
+            if not (search_keyword or "").strip() and kwargs:
+                search_keyword = self._pick_first_non_empty(
+                    kwargs,
+                    ("keyword", "query", "search", "plugin_keyword", "name"),
+                )
+
+            if not (search_keyword or "").strip():
+                return "[SEARCH_FAIL] 搜索关键词为空，请先告诉我你想找什么功能的插件。"
+
             results = await self.service.search_plugins(search_keyword)
             if not results:
                 return f"未找到与 '{search_keyword}' 有关的插件。请告诉用户需要换个关键词试试。"
@@ -74,19 +121,52 @@ class PluginFinder(Star):
     async def install_plugin_tool(
         self,
         event: AstrMessageEvent,
-        plugin_name: str,
-        has_user_confirmed: bool,
+        plugin_name: str = "",
+        has_user_confirmed=False,
+        **kwargs,
     ):
         """当用户明确同意安装某个特定的插件后（如：回答“是的”、“安装 xx”），调用此工具进行实际的下载和安装。
         plugin_name 请提供在 search 工具中获得的完整插件名称（如 astrbot-plugin-xxx）。
         【极其重要】：如果用户没有明确同意安装，必须将 has_user_confirmed 设置为 False！
         如果由于任何原因你不确定用户是否同意，也设为 False！
+
+        Args:
+            plugin_name (str): 目标插件名称，建议传 search 返回的完整 plugin_name。
+            has_user_confirmed (bool): 用户是否已明确确认安装。
         """
         try:
+            if not (plugin_name or "").strip() and kwargs:
+                plugin_name = self._pick_first_non_empty(
+                    kwargs,
+                    (
+                        "plugin_name",
+                        "plugin",
+                        "name",
+                        "plugin_keyword",
+                        "target_plugin",
+                        "pluginName",
+                    ),
+                )
+
+            confirmed_value = has_user_confirmed
+            if kwargs:
+                for key in (
+                    "has_user_confirmed",
+                    "confirmed",
+                    "user_confirmed",
+                    "confirm",
+                    "is_confirmed",
+                ):
+                    if key in kwargs:
+                        confirmed_value = kwargs[key]
+                        break
+
+            has_user_confirmed_bool = self._as_confirmed_flag(confirmed_value)
+
             return await self.service.install_plugin_tool(
                 event=event,
                 plugin_name=plugin_name,
-                has_user_confirmed=has_user_confirmed,
+                has_user_confirmed=has_user_confirmed_bool,
             )
         except asyncio.CancelledError:
             raise
