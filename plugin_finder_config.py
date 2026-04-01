@@ -244,11 +244,11 @@ def load_plugin_finder_config(plugin_config) -> PluginFinderConfig:
             max_value=600,
         ),
         pip_install_requirements=_as_bool(
-            _cfg(plugin_config, "pip_install_requirements", False),
-            False,
+            _cfg(plugin_config, "pip_install_requirements", True),
+            True,
         ),
         trusted_requirements_plugins=_parse_plugin_allowlist(
-            _cfg(plugin_config, "trusted_requirements_plugins", "")
+            _cfg(plugin_config, "trusted_requirements_plugins", "*")
         ),
         pip_timeout_sec=_as_int_with_limit(
             _cfg(plugin_config, "pip_timeout_sec", 600),

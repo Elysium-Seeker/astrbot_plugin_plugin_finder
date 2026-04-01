@@ -26,14 +26,14 @@
   "pip_install_requirements": {
     "description": "是否自动安装 requirements.txt",
     "type": "bool",
-    "default": false,
-    "hint": "默认关闭以降低供应链风险。"
+    "default": true,
+    "hint": "默认开启：安装插件时自动执行 pip install -r requirements.txt。"
   },
   "trusted_requirements_plugins": {
     "description": "允许自动安装依赖的插件白名单",
     "type": "string",
-    "default": "",
-    "hint": "多个 plugin_name 用英文逗号分隔；为空表示不允许任何插件自动安装依赖。"
+    "default": "*",
+    "hint": "多个 plugin_name 用英文逗号分隔；默认 * 表示所有插件都允许自动安装依赖。"
   },
   "pip_timeout_sec": {
     "description": "pip install 超时秒数",

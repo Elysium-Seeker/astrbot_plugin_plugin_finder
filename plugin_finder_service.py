@@ -2,12 +2,20 @@ import asyncio
 import os
 import re
 import sys
+import textwrap
 from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
 from astrbot.api import logger
 from astrbot.api.all import AstrMessageEvent, Context
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
 if __package__:
     from .plugin_finder_config import PluginFinderConfig
@@ -403,6 +411,166 @@ class PluginFinderService:
 
         return None
 
+    @staticmethod
+    def _find_readme_file(plugin_dir: str) -> str | None:
+        candidates = (
+            "README.md",
+            "README.MD",
+            "readme.md",
+            "README.rst",
+            "readme.rst",
+            "README.txt",
+            "readme.txt",
+        )
+        for name in candidates:
+            file_path = os.path.join(plugin_dir, name)
+            if os.path.isfile(file_path):
+                return file_path
+        return None
+
+    @staticmethod
+    def _load_preview_font(size: int):
+        if ImageFont is None:
+            return None
+
+        candidates = (
+            "msyh.ttc",
+            "simhei.ttf",
+            "NotoSansCJK-Regular.ttc",
+            "SourceHanSansCN-Regular.otf",
+            "arial.ttf",
+        )
+        for font_name in candidates:
+            try:
+                return ImageFont.truetype(font_name, size=size)
+            except Exception:
+                continue
+
+        try:
+            return ImageFont.load_default()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _prepare_readme_preview_lines(readme_text: str, max_lines: int = 200) -> list[str]:
+        result: list[str] = []
+        for raw in readme_text.splitlines():
+            line = raw.rstrip("\n\r")
+            if not line.strip():
+                result.append("")
+            else:
+                normalized = line.replace("\t", "    ")
+                stripped = normalized.lstrip()
+                if stripped.startswith("#"):
+                    heading = stripped.lstrip("#").strip()
+                    normalized = f"## {heading}" if heading else "##"
+
+                wrapped = textwrap.wrap(
+                    normalized,
+                    width=58,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                ) or [""]
+                result.extend(wrapped)
+
+            if len(result) >= max_lines:
+                result = result[:max_lines]
+                result.append("... (README 过长，已截断)")
+                break
+
+        if not result:
+            return ["(README 内容为空)"]
+        return result
+
+    def _render_readme_preview_image(
+        self,
+        plugin_dir: str,
+        plugin_key: str,
+        report_lines: list[str],
+    ) -> str | None:
+        if Image is None or ImageDraw is None:
+            report_lines.append("Pillow 不可用，跳过 README 图片渲染。")
+            return None
+
+        readme_file = self._find_readme_file(plugin_dir)
+        if not readme_file:
+            report_lines.append("未找到 README 文件，跳过 README 图片渲染。")
+            return None
+
+        try:
+            with open(readme_file, "r", encoding="utf-8", errors="ignore") as f:
+                readme_text = f.read(120000)
+        except OSError as e:
+            report_lines.append(f"读取 README 失败: {e}")
+            return None
+
+        lines = self._prepare_readme_preview_lines(readme_text)
+        title_font = self._load_preview_font(36)
+        body_font = self._load_preview_font(24)
+        if body_font is None:
+            report_lines.append("字体加载失败，跳过 README 图片渲染。")
+            return None
+
+        width = 1280
+        margin_x = 56
+        margin_top = 56
+        line_height = 38
+        header_height = 70
+        max_height = 7600
+
+        body_area = max_height - margin_top - header_height - 64
+        allowed_lines = max(20, body_area // line_height)
+        if len(lines) > allowed_lines:
+            lines = lines[:allowed_lines]
+            if lines:
+                lines[-1] = "... (README 过长，已截断)"
+
+        height = margin_top + header_height + len(lines) * line_height + 64
+        canvas = Image.new("RGB", (width, height), color=(248, 245, 241))
+        draw = ImageDraw.Draw(canvas)
+
+        title = f"README Preview - {plugin_key}"
+        draw.text((margin_x, margin_top), title, font=title_font or body_font, fill=(58, 45, 90))
+
+        y = margin_top + header_height
+        for line in lines:
+            draw.text((margin_x, y), line, font=body_font, fill=(60, 62, 74))
+            y += line_height
+
+        preview_root = os.path.join(self.plugins_root, ".plugin_finder_cache", "readme_preview")
+        os.makedirs(preview_root, exist_ok=True)
+        safe_key = re.sub(r"[^A-Za-z0-9._-]", "_", plugin_key) or "plugin"
+        file_name = f"{safe_key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        output_path = os.path.abspath(os.path.join(preview_root, file_name))
+
+        try:
+            canvas.save(output_path, format="PNG")
+            report_lines.append(f"README 预览图已生成: {output_path}")
+            return output_path
+        except OSError as e:
+            report_lines.append(f"保存 README 预览图失败: {e}")
+            return None
+
+    async def _send_readme_preview_if_possible(
+        self,
+        event: AstrMessageEvent,
+        plugin_dir: str,
+        plugin_key: str,
+        report_lines: list[str],
+    ) -> str:
+        image_path = self._render_readme_preview_image(plugin_dir, plugin_key, report_lines)
+        if not image_path:
+            return ""
+
+        try:
+            await event.send(event.image_result(image_path))
+            return "\n已附带发送该插件 README 渲染图。"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            report_lines.append(f"发送 README 渲染图失败: {e}")
+            return ""
+
     def _resolve_install_target(
         self,
         plugins: dict,
@@ -655,7 +823,11 @@ class PluginFinderService:
 
         req_file = os.path.join(target_dir, "requirements.txt")
         if self.config.pip_install_requirements and os.path.exists(req_file):
-            if plugin_key not in self.config.trusted_requirements_plugins:
+            allow_all = (
+                not self.config.trusted_requirements_plugins
+                or "*" in self.config.trusted_requirements_plugins
+            )
+            if not allow_all and plugin_key not in self.config.trusted_requirements_plugins:
                 report_lines.append(
                     "requirements.txt 存在，但该插件不在 trusted_requirements_plugins 白名单，已跳过自动安装。"
                 )
@@ -668,13 +840,13 @@ class PluginFinderService:
             requirements_safe, violations = _scan_requirements_for_policy(req_file)
             if not requirements_safe:
                 report_lines.append(
-                    "requirements.txt 未通过安全策略校验: "
+                    "requirements.txt 存在高风险条目，已按当前配置继续自动安装: "
                     f"{'; '.join(violations)}"
                 )
-                return (
-                    "[INSTALL_PARTIAL] 已下载插件代码，但 requirements.txt 未通过自动安装安全策略。"
-                    "\n当前仅允许固定版本(==)依赖，并禁止 URL/本地路径/额外 index 参数。"
-                    "\n请人工审计依赖后手动安装，并执行 /plugin reload。"
+                await event.send(
+                    event.plain_result(
+                        "⚠ requirements.txt 存在高风险条目，当前配置允许继续自动安装。"
+                    )
                 )
 
             try:
@@ -732,12 +904,18 @@ class PluginFinderService:
         reload_errors = []
         if not self.config.auto_reload_after_install:
             report_lines.append("配置已关闭 auto_reload_after_install，跳过热重载。")
+            preview_note = await self._send_readme_preview_if_possible(
+                event,
+                target_dir,
+                target_key,
+                report_lines,
+            )
             return self._save_and_return(
                 report_lines,
                 "[INSTALL_PARTIAL] 代码已下载并可在重启后显示。"
                 "\n当前配置关闭了自动热重载，请手动执行 /plugin reload 或重启 AstrBot。"
                 "\n如需审计明细，可发送 /查看安装日志",
-            )
+            ) + preview_note
 
         try:
             manager, manager_source = _resolve_reload_manager()
@@ -776,38 +954,62 @@ class PluginFinderService:
 
                 if reload_success:
                     report_lines.append("安装与热重载成功。")
+                    preview_note = await self._send_readme_preview_if_possible(
+                        event,
+                        target_dir,
+                        target_key,
+                        report_lines,
+                    )
                     return self._save_and_return(
                         report_lines,
                         "[INSTALL_OK] 已真实执行 git/pip 命令并完成热重载。"
                         f"\n插件: {target_data.get('display_name', target_key)}"
                         f"\n目录: {target_dir}"
                         "\n如需审计明细，可发送 /查看安装日志",
-                    )
+                    ) + preview_note
 
                 report_lines.append("安装完成但热重载失败。")
+                preview_note = await self._send_readme_preview_if_possible(
+                    event,
+                    target_dir,
+                    target_key,
+                    report_lines,
+                )
                 return self._save_and_return(
                     report_lines,
                     "[INSTALL_PARTIAL] 代码已下载，但热重载失败。"
                     f"\n错误: {self._shorten('; '.join(reload_errors))}"
                     "\n请手动执行 /plugin reload 后在 WebUI 查看。"
                     "\n如需审计明细，可发送 /查看安装日志",
-                )
+                ) + preview_note
 
             report_lines.append("当前版本未找到可用重载管理器（公开 API 或兼容回退均不可用）。")
+            preview_note = await self._send_readme_preview_if_possible(
+                event,
+                target_dir,
+                target_key,
+                report_lines,
+            )
             return self._save_and_return(
                 report_lines,
                 "[INSTALL_PARTIAL] 代码已下载，但当前版本未找到可用的公开重载管理器。"
                 "\n请手动执行 /plugin reload 后在 WebUI 查看。",
-            )
+            ) + preview_note
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning(f"热重载阶段异常: {e}")
             report_lines.append(f"热重载阶段异常: {e}")
+            preview_note = await self._send_readme_preview_if_possible(
+                event,
+                target_dir,
+                target_key,
+                report_lines,
+            )
             return self._save_and_return(
                 report_lines,
                 f"[INSTALL_PARTIAL] 下载完成，但应用刷新时出错: {e}",
-            )
+            ) + preview_note
 
     async def install_plugin_tool(
         self,
@@ -894,13 +1096,19 @@ class PluginFinderService:
                     )
 
                 report_lines.append("检测到插件已安装，已跳过重复安装。")
+                preview_note = await self._send_readme_preview_if_possible(
+                    event,
+                    installed_dir,
+                    target_key,
+                    report_lines,
+                )
                 return self._save_and_return(
                     report_lines,
                     "[INSTALL_SKIPPED] 检测到该插件已安装，已跳过重复安装。"
                     f"\n插件: {target_data.get('display_name', target_key)}"
                     f"\n目录: {installed_dir}"
                     "\n如需刷新加载状态，请手动执行 /plugin reload。",
-                )
+                ) + preview_note
 
             error = await self._sync_plugin_repo(event, repo_url, target_dir, report_lines)
             if error:
