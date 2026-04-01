@@ -825,6 +825,22 @@ class PluginFinderService:
         async with self._install_lock:
             report_lines.append("已进入安装互斥区：执行 clone/pull、依赖安装和热重载。")
 
+            metadata_file = os.path.join(target_dir, "metadata.yaml")
+            if os.path.isdir(target_dir) and os.path.exists(metadata_file):
+                if os.path.isdir(os.path.join(target_dir, ".git")):
+                    origin_error = await self._verify_git_origin(target_dir, repo_url, report_lines)
+                    if origin_error:
+                        return self._save_and_return(report_lines, origin_error)
+
+                report_lines.append("检测到插件目录已存在且包含 metadata.yaml，已跳过重复安装。")
+                return self._save_and_return(
+                    report_lines,
+                    "[INSTALL_SKIPPED] 检测到该插件已安装，已跳过重复安装。"
+                    f"\n插件: {target_data.get('display_name', target_key)}"
+                    f"\n目录: {target_dir}"
+                    "\n如需刷新加载状态，请手动执行 /plugin reload。",
+                )
+
             error = await self._sync_plugin_repo(event, repo_url, target_dir, report_lines)
             if error:
                 return self._save_and_return(report_lines, error)

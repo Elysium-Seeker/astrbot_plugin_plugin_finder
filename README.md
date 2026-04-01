@@ -13,6 +13,7 @@
 
 ## 🆕 最近更新
 
+- `v1.1.13`：新增“已安装跳过”机制：目标插件目录已存在且包含 `metadata.yaml` 时，不再重复执行 clone/pull/pip，直接返回 `[INSTALL_SKIPPED]`。
 - `v1.1.12`：针对 `install_astrbot_plugin` 60 秒超时优化：移除安装前重复的 `git ls-remote` 探测、`git clone` 改为浅克隆（`--depth 1 --single-branch --no-tags`）、安装锁占用时改为快速失败并提示重试（避免排队超时）。
 - `v1.1.11`：修复自动安装工具 `handler parameter mismatch`：补齐 llm_tool 标准 Args 参数定义，安装与搜索工具改为缺参/别名参数兼容解析（避免模型侧参数名偏差导致调用失败）。
 - `v1.1.10`：继续根据最新评论加固：入口与服务层统一透传 `asyncio.CancelledError`、高风险命令增加管理员权限、配置展示不再泄露确认词、`git_bin` 与超时配置增加安全边界、安装锁缩小到本地变更阶段并新增 requirements 安全策略校验。
