@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime
 import httpx
 from astrbot.api.all import Context, AstrMessageEvent
-from astrbot.api.event.filter import command, llm_tool
+from astrbot.api.event import filter
 from astrbot.api.star import register, Star
 
 
@@ -12,7 +12,7 @@ from astrbot.api.star import register, Star
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.2",
+    "1.1.3",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -40,6 +40,7 @@ class PluginFinder(Star):
         )
         self.git_timeout_sec = self._as_int(self._cfg("git_timeout_sec", 120), 120)
         self.pip_timeout_sec = self._as_int(self._cfg("pip_timeout_sec", 600), 600)
+        self._install_lock = asyncio.Lock()
         self._last_install_report = "尚无安装记录。"
 
         # 确定插件根目录
@@ -127,7 +128,57 @@ class PluginFinder(Star):
             return bool(result[0]), str(result[1])
         return bool(result), ""
 
-    @llm_tool(name="search_astrbot_plugin")
+    def _match_plugin_target(
+        self,
+        plugins: dict,
+        plugin_name: str,
+    ) -> tuple[str | None, dict | None, list[str]]:
+        norm_input = self._normalize(plugin_name)
+        exact_matches: list[tuple[str, dict]] = []
+        fuzzy_matches: list[tuple[str, dict]] = []
+
+        for key, data in plugins.items():
+            key_str = str(key)
+            display_name = str(data.get("display_name") or key_str)
+            repo_name = str(data.get("repo") or "").rstrip("/").split("/")[-1]
+
+            norm_key = self._normalize(key_str)
+            norm_display = self._normalize(display_name)
+            norm_repo = self._normalize(repo_name)
+
+            if norm_input in {norm_key, norm_display, norm_repo}:
+                exact_matches.append((key_str, data))
+            elif norm_input and (
+                norm_input in norm_key
+                or norm_input in norm_display
+                or norm_input in norm_repo
+            ):
+                fuzzy_matches.append((key_str, data))
+
+        if len(exact_matches) == 1:
+            key, data = exact_matches[0]
+            return key, data, []
+
+        if len(exact_matches) > 1:
+            candidates = [
+                f"{k} ({str(d.get('display_name') or k)})" for k, d in exact_matches[:8]
+            ]
+            return None, None, candidates
+
+        # 只有唯一候选且输入足够长时，才允许模糊匹配自动安装，避免误装。
+        if len(fuzzy_matches) == 1 and len(norm_input) >= 4:
+            key, data = fuzzy_matches[0]
+            return key, data, []
+
+        if len(fuzzy_matches) > 0:
+            candidates = [
+                f"{k} ({str(d.get('display_name') or k)})" for k, d in fuzzy_matches[:8]
+            ]
+            return None, None, candidates
+
+        return None, None, []
+
+    @filter.llm_tool(name="search_astrbot_plugin")
     async def search_plugin(self, event: AstrMessageEvent, search_keyword: str):
         """当用户想要查找、安装某种功能的插件时，使用此工具去官方市场搜索。
         根据返回的结果，向用户简单推荐最符合的一个或几个插件（包含其基本功能介绍）。
@@ -163,7 +214,7 @@ class PluginFinder(Star):
             + str(results)
         )
 
-    @llm_tool(name="install_astrbot_plugin")
+    @filter.llm_tool(name="install_astrbot_plugin")
     async def install_plugin_tool(
         self, event: AstrMessageEvent, plugin_name: str, has_user_confirmed: bool
     ):
@@ -172,17 +223,34 @@ class PluginFinder(Star):
         【极其重要】：如果用户没有明确同意安装，必须将 has_user_confirmed 设置为 False！
         如果由于任何原因你不确定用户是否同意，也设为 False！
         """
+        if not has_user_confirmed:
+            report_lines = [
+                f"时间: {datetime.now().isoformat(timespec='seconds')}",
+                f"用户输入: {plugin_name}",
+                "用户未确认安装，流程终止。",
+            ]
+            self._last_install_report = "\n".join(report_lines)
+            return "[INSTALL_BLOCKED] 执行已被拒绝：请先向用户询问并确认安装，再调用此工具。"
+
+        if self._install_lock.locked():
+            await event.send(
+                event.plain_result("⏳ 当前有其他安装任务执行中，已加入队列，请稍候..."),
+            )
+
+        async with self._install_lock:
+            return await self._install_plugin_tool_locked(event, plugin_name)
+
+    async def _install_plugin_tool_locked(
+        self,
+        event: AstrMessageEvent,
+        plugin_name: str,
+    ) -> str:
         report_lines = [
             f"时间: {datetime.now().isoformat(timespec='seconds')}",
             f"用户输入: {plugin_name}",
             f"插件根目录: {self.plugins_root}",
             f"配置: market_api_url={self.market_api_url}, git_bin={self.git_bin}",
         ]
-
-        if not has_user_confirmed:
-            report_lines.append("用户未确认安装，流程终止。")
-            self._last_install_report = "\n".join(report_lines)
-            return "[INSTALL_BLOCKED] 执行已被拒绝：请先向用户询问并确认安装，再调用此工具。"
 
         # 执行耗时操作时可以先利用 yield 发送提示，但 llm_tool 中我们也可以借助于 event.send
         await event.send(
@@ -198,34 +266,22 @@ class PluginFinder(Star):
             self._last_install_report = "\n".join(report_lines)
             return "[INSTALL_FAIL] 无法访问官方市场 API，请稍后重试。"
 
-        target_data = None
-        target_key = None
-        norm_plugin_name = self._normalize(plugin_name)
-
-        # 尝试精确匹配（无视连接符大小写）
-        for key, data in plugins.items():
-            norm_key = self._normalize(key)
-            norm_repo = self._normalize(str(data.get("repo") or "").split("/")[-1])
-            if norm_plugin_name == norm_key or norm_plugin_name == norm_repo:
-                target_data = data
-                target_key = key
-                break
+        target_key, target_data, candidates = self._match_plugin_target(
+            plugins,
+            plugin_name,
+        )
 
         if not target_data:
-            # 尝试宽松匹配
-            for key, data in plugins.items():
-                norm_key = self._normalize(key)
-                norm_display = self._normalize(str(data.get("display_name") or ""))
-                if (
-                    norm_plugin_name in norm_key
-                    or norm_plugin_name in norm_display
-                    or norm_key in norm_plugin_name
-                ):
-                    target_data = data
-                    target_key = key
-                    break
+            if candidates:
+                report_lines.append("匹配存在歧义，已阻止自动安装。")
+                report_lines.append(f"候选项: {', '.join(candidates)}")
+                self._last_install_report = "\n".join(report_lines)
+                return (
+                    "[INSTALL_FAIL] 找到多个可能匹配的插件，为避免误装已终止。"
+                    "\n请使用更精确的插件名重试（建议直接使用 search 返回的 plugin_name）。"
+                    f"\n候选项: {', '.join(candidates)}"
+                )
 
-        if not target_data:
             report_lines.append("市场匹配失败。")
             self._last_install_report = "\n".join(report_lines)
             return f"[INSTALL_FAIL] 安装失败：在市场中未找到名为 {plugin_name} 的合法插件。"
@@ -424,12 +480,12 @@ class PluginFinder(Star):
             self._last_install_report = "\n".join(report_lines)
             return f"[INSTALL_PARTIAL] 下载完成，但应用刷新时出错: {e}"
 
-    @command("查看安装日志")
+    @filter.command("查看安装日志")
     async def show_install_log(self, event: AstrMessageEvent):
         """查看最近一次安装流程的详细日志。"""
         yield event.plain_result(self._shorten(self._last_install_report, limit=3800))
 
-    @command("查看插件配置")
+    @filter.command("查看插件配置")
     async def show_plugin_config(self, event: AstrMessageEvent):
         """查看当前插件运行时配置（来自 _conf_schema.json）。"""
         info = (
@@ -444,7 +500,7 @@ class PluginFinder(Star):
         )
         yield event.plain_result(info)
 
-    @command("直接安装插件")
+    @filter.command("直接安装插件")
     async def cmd_direct_install(self, event: AstrMessageEvent, plugin_keyword: str):
         """
         通过命令直接强制安装：/直接安装插件 <插件名>
