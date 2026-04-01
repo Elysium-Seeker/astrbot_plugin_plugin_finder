@@ -43,5 +43,17 @@
     "type": "bool",
     "default": true,
     "hint": "用于修复历史遗留目录导致的无法 pull 问题。"
+  },
+  "allowed_repo_hosts": {
+    "description": "允许安装的仓库域名白名单",
+    "type": "string",
+    "default": "github.com",
+    "hint": "多个域名用英文逗号分隔，例如 github.com,git.example.com。"
+  },
+  "direct_install_confirm_phrase": {
+    "description": "直接安装命令确认词",
+    "type": "string",
+    "default": "确认安装",
+    "hint": "执行 /直接安装插件 时必须提供该确认词，防止误触发。"
   }
 }

@@ -1,8 +1,11 @@
 import os
 import sys
+import re
 import asyncio
 from datetime import datetime
+from urllib.parse import urlparse
 import httpx
+from astrbot.api import logger
 from astrbot.api.all import Context, AstrMessageEvent
 from astrbot.api.event import filter
 from astrbot.api.star import register, Star
@@ -12,7 +15,7 @@ from astrbot.api.star import register, Star
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.5",
+    "1.1.6",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -38,6 +41,12 @@ class PluginFinder(Star):
             self._cfg("recover_non_git_dir", True),
             True,
         )
+        self.allowed_repo_hosts = self._parse_host_allowlist(
+            self._cfg("allowed_repo_hosts", "github.com")
+        )
+        self.direct_install_confirm_phrase = str(
+            self._cfg("direct_install_confirm_phrase", "确认安装")
+        ).strip() or "确认安装"
         self.git_timeout_sec = self._as_int(self._cfg("git_timeout_sec", 120), 120)
         self.pip_timeout_sec = self._as_int(self._cfg("pip_timeout_sec", 600), 600)
         self._install_lock = asyncio.Lock()
@@ -54,7 +63,8 @@ class PluginFinder(Star):
             if hasattr(self.plugin_config, "get"):
                 return self.plugin_config.get(key, default)
             return default
-        except Exception:
+        except Exception as e:
+            logger.warning(f"读取配置项失败 key={key}: {e}")
             return default
 
     @staticmethod
@@ -72,17 +82,60 @@ class PluginFinder(Star):
         try:
             parsed = int(value)
             return parsed if parsed > 0 else default
-        except Exception:
+        except Exception as e:
+            logger.warning(f"整数配置解析失败 value={value}: {e}")
             return default
+
+    @staticmethod
+    def _parse_host_allowlist(value) -> set[str]:
+        if isinstance(value, str):
+            raw_items = [i.strip().lower() for i in value.split(",")]
+            return {i for i in raw_items if i}
+        if isinstance(value, (list, tuple, set)):
+            return {str(i).strip().lower() for i in value if str(i).strip()}
+        return {"github.com"}
+
+    def _is_allowed_repo_host(self, repo_url: str) -> bool:
+        try:
+            host = (urlparse(repo_url).hostname or "").strip().lower()
+        except Exception:
+            return False
+        if not host:
+            return False
+        if host in self.allowed_repo_hosts:
+            return True
+        return any(host.endswith(f".{allowed}") for allowed in self.allowed_repo_hosts)
+
+    @staticmethod
+    def _extract_safe_repo_name(repo_url: str) -> str | None:
+        path = (urlparse(repo_url).path or "").rstrip("/")
+        if not path:
+            return None
+        repo_name = path.split("/")[-1]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+        if repo_name in {"", ".", ".."}:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", repo_name):
+            return None
+        return repo_name
 
     async def _fetch_market_plugins(self) -> dict:
         """获取官方市场的全部插件数据"""
         try:
             async with httpx.AsyncClient(timeout=20) as client:
                 resp = await client.get(self.market_api_url)
-                if resp.status_code == 200 and isinstance(resp.json(), dict):
-                    return resp.json()
-        except Exception:
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"市场 API 返回异常状态码: {resp.status_code}, url={self.market_api_url}"
+                    )
+                    return {}
+                data = resp.json()
+                if isinstance(data, dict):
+                    return data
+                logger.warning("市场 API 返回的 JSON 不是对象类型。")
+        except Exception as e:
+            logger.warning(f"拉取市场插件失败: {e}")
             return {}
         return {}
 
@@ -106,12 +159,21 @@ class PluginFinder(Star):
         cwd: str | None = None,
         timeout_sec: int | None = None,
     ) -> tuple[int, str, str]:
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            command_name = args[0] if args else ""
+            logger.error(f"命令不可用: {command_name}")
+            return 127, "", f"命令不存在: {command_name}"
+        except Exception as e:
+            logger.error(f"启动命令失败: {' '.join(args)}; 错误: {e}")
+            return 1, "", f"启动命令失败: {e}"
+
         timeout_value = timeout_sec if timeout_sec is not None else self.git_timeout_sec
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -121,6 +183,7 @@ class PluginFinder(Star):
         except TimeoutError:
             process.kill()
             await process.communicate()
+            logger.warning(f"命令超时: {' '.join(args)}")
             return 124, "", f"命令超时({timeout_value}s): {' '.join(args)}"
         out_text = stdout.decode("utf-8", errors="ignore")
         err_text = stderr.decode("utf-8", errors="ignore")
@@ -245,8 +308,53 @@ class PluginFinder(Star):
         if not repo_url.startswith("http"):
             repo_url = f"https://github.com/{repo_url}"
 
-        repo_name = repo_url.rstrip("/").split("/")[-1]
-        target_dir = os.path.join(self.plugins_root, repo_name)
+        if not self._is_allowed_repo_host(repo_url):
+            report_lines.append(f"仓库域名不在白名单内: {repo_url}")
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[INSTALL_FAIL] 仓库地址不在可信域名白名单内，已阻止安装。",
+            )
+
+        repo_name = self._extract_safe_repo_name(repo_url)
+        if not repo_name:
+            report_lines.append(f"仓库名不合法: {repo_url}")
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[INSTALL_FAIL] 仓库地址解析失败或仓库名不安全，已阻止安装。",
+            )
+
+        plugins_root_abs = os.path.abspath(self.plugins_root)
+        target_dir = os.path.abspath(os.path.join(self.plugins_root, repo_name))
+        try:
+            if os.path.commonpath([plugins_root_abs, target_dir]) != plugins_root_abs:
+                report_lines.append(f"路径越界风险: plugins_root={plugins_root_abs}, target={target_dir}")
+                return (
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "[INSTALL_FAIL] 插件目录安全校验失败，已阻止安装。",
+                )
+        except Exception as e:
+            report_lines.append(f"目录安全校验异常: {e}")
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[INSTALL_FAIL] 插件目录安全校验异常，已阻止安装。",
+            )
+
         report_lines.append(f"匹配插件键: {target_key}")
         report_lines.append(f"仓库地址: {repo_url}")
         report_lines.append(f"目标目录: {target_dir}")
@@ -324,6 +432,7 @@ class PluginFinder(Star):
                     report_lines.append(f"git clone 错误: {self._shorten(err)}")
                     return f"[INSTALL_FAIL] Git Clone 失败: {self._shorten(err)}"
         except Exception as e:
+            logger.warning(f"Git 阶段异常: {e}")
             report_lines.append(f"Git 阶段异常: {e}")
             return f"[INSTALL_FAIL] 安装中发生本地异常: {e}"
 
@@ -370,6 +479,7 @@ class PluginFinder(Star):
                     report_lines.append(f"pip install 错误: {self._shorten(err)}")
                     return f"[INSTALL_FAIL] 依赖安装失败: {self._shorten(err)}"
             except Exception as e:
+                logger.warning(f"pip 阶段异常: {e}")
                 report_lines.append(f"pip 阶段异常: {e}")
                 return f"[INSTALL_FAIL] 依赖安装异常: {e}"
         elif not self.pip_install_requirements:
@@ -411,6 +521,7 @@ class PluginFinder(Star):
                     if not reload_success and reload_err:
                         reload_errors.append(reload_err)
                 except Exception as e:
+                    logger.warning(f"定向热重载异常 repo={repo_name}: {e}")
                     reload_errors.append(f"reload({repo_name}) 异常: {e}")
                     report_lines.append(f"reload({repo_name}) 异常: {e}")
 
@@ -422,6 +533,7 @@ class PluginFinder(Star):
                         if not reload_success and reload_err:
                             reload_errors.append(reload_err)
                     except Exception as e:
+                        logger.warning(f"全量热重载异常: {e}")
                         reload_errors.append(f"reload() 异常: {e}")
                         report_lines.append(f"reload() 异常: {e}")
                 elif not reload_success:
@@ -453,6 +565,7 @@ class PluginFinder(Star):
                 "\n请手动执行 /plugin reload 后在 WebUI 查看。",
             )
         except Exception as e:
+            logger.warning(f"热重载阶段异常: {e}")
             report_lines.append(f"热重载阶段异常: {e}")
             return self._save_and_return(
                 report_lines,
@@ -598,15 +711,29 @@ class PluginFinder(Star):
             f"pip_timeout_sec: {self.pip_timeout_sec}\n"
             f"auto_reload_after_install: {self.auto_reload_after_install}\n"
             f"full_reload_fallback: {self.full_reload_fallback}\n"
-            f"recover_non_git_dir: {self.recover_non_git_dir}"
+            f"recover_non_git_dir: {self.recover_non_git_dir}\n"
+            f"allowed_repo_hosts: {', '.join(sorted(self.allowed_repo_hosts))}\n"
+            f"direct_install_confirm_phrase: {self.direct_install_confirm_phrase}"
         )
         yield event.plain_result(info)
 
     @filter.command("直接安装插件")
-    async def cmd_direct_install(self, event: AstrMessageEvent, plugin_keyword: str):
+    async def cmd_direct_install(
+        self,
+        event: AstrMessageEvent,
+        plugin_keyword: str,
+        confirm_phrase: str = "",
+    ):
         """
-        通过命令直接强制安装：/直接安装插件 <插件名>
+        通过命令直接强制安装：/直接安装插件 <插件名> <确认词>
         """
+        if confirm_phrase.strip() != self.direct_install_confirm_phrase:
+            yield event.plain_result(
+                "为避免误触发，请补充确认词。"
+                f"\n示例：/直接安装插件 {plugin_keyword} {self.direct_install_confirm_phrase}"
+            )
+            return
+
         yield event.plain_result(f"执行直接安装命令: {plugin_keyword}...")
         result = await self.install_plugin_tool(event, plugin_keyword, True)
         yield event.plain_result(result)
