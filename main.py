@@ -4,10 +4,10 @@ from astrbot.api.all import Context, AstrMessageEvent
 from astrbot.api.event import filter
 from astrbot.api.star import register, Star
 
-try:
+if __package__:
     from .plugin_finder_config import load_plugin_finder_config
     from .plugin_finder_service import PluginFinderService
-except ImportError:
+else:
     from plugin_finder_config import load_plugin_finder_config
     from plugin_finder_service import PluginFinderService
 
@@ -16,7 +16,7 @@ except ImportError:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.7",
+    "1.1.8",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -85,6 +85,11 @@ class PluginFinder(Star):
         """
         通过命令直接强制安装：/直接安装插件 <插件名> <确认词>
         """
+        plugin_keyword = plugin_keyword.strip()
+        if not plugin_keyword:
+            yield event.plain_result("请输入有效插件名，例如：/直接安装插件 astrbot_plugin_weather 确认安装")
+            return
+
         if confirm_phrase.strip() != self.config.direct_install_confirm_phrase:
             yield event.plain_result(
                 "为避免误触发，请补充确认词。"

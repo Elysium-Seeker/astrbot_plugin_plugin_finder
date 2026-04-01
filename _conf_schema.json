@@ -5,6 +5,12 @@
     "default": "https://api.soulter.top/astrbot/plugins",
     "hint": "一般无需修改。若使用私有镜像，可改为自定义地址。"
   },
+  "allowed_market_api_hosts": {
+    "description": "允许访问的市场 API 域名白名单",
+    "type": "string",
+    "default": "api.soulter.top",
+    "hint": "多个域名用英文逗号分隔；market_api_url 不在白名单时会自动回退默认地址。"
+  },
   "git_bin": {
     "description": "Git 可执行文件名或路径",
     "type": "string",
@@ -20,7 +26,14 @@
   "pip_install_requirements": {
     "description": "是否自动安装 requirements.txt",
     "type": "bool",
-    "default": true
+    "default": false,
+    "hint": "默认关闭以降低供应链风险。"
+  },
+  "trusted_requirements_plugins": {
+    "description": "允许自动安装依赖的插件白名单",
+    "type": "string",
+    "default": "",
+    "hint": "多个 plugin_name 用英文逗号分隔；为空表示不允许任何插件自动安装依赖。"
   },
   "pip_timeout_sec": {
     "description": "pip install 超时秒数",

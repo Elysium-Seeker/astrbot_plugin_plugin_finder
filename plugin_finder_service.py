@@ -9,9 +9,9 @@ import httpx
 from astrbot.api import logger
 from astrbot.api.all import AstrMessageEvent, Context
 
-try:
+if __package__:
     from .plugin_finder_config import PluginFinderConfig
-except ImportError:
+else:
     from plugin_finder_config import PluginFinderConfig
 
 
@@ -56,9 +56,11 @@ class PluginFinderService:
     def format_runtime_config(self) -> str:
         return (
             f"market_api_url: {self.config.market_api_url}\n"
+            f"allowed_market_api_hosts: {', '.join(sorted(self.config.allowed_market_api_hosts))}\n"
             f"git_bin: {self.config.git_bin}\n"
             f"git_timeout_sec: {self.config.git_timeout_sec}\n"
             f"pip_install_requirements: {self.config.pip_install_requirements}\n"
+            f"trusted_requirements_plugins: {', '.join(sorted(self.config.trusted_requirements_plugins)) or '(空)'}\n"
             f"pip_timeout_sec: {self.config.pip_timeout_sec}\n"
             f"auto_reload_after_install: {self.config.auto_reload_after_install}\n"
             f"full_reload_fallback: {self.config.full_reload_fallback}\n"
@@ -66,6 +68,20 @@ class PluginFinderService:
             f"allowed_repo_hosts: {', '.join(sorted(self.config.allowed_repo_hosts))}\n"
             f"direct_install_confirm_phrase: {self.config.direct_install_confirm_phrase}"
         )
+
+    @staticmethod
+    def _iter_market_plugin_items(plugins: dict) -> list[tuple[str, dict]]:
+        if not isinstance(plugins, dict):
+            logger.warning("市场 API 返回结构异常：顶层不是对象，已忽略。")
+            return []
+
+        valid_items: list[tuple[str, dict]] = []
+        for key, data in plugins.items():
+            if not isinstance(data, dict):
+                logger.warning(f"市场项结构异常，已跳过 key={key}")
+                continue
+            valid_items.append((str(key), data))
+        return valid_items
 
     async def _fetch_market_plugins(self) -> dict:
         """获取官方市场的全部插件数据"""
@@ -87,10 +103,14 @@ class PluginFinderService:
         return {}
 
     async def search_plugins(self, search_keyword: str) -> list[dict]:
+        search_keyword = (search_keyword or "").strip()
+        if not search_keyword:
+            return []
+
         plugins = await self._fetch_market_plugins()
         results = []
         key_lower = search_keyword.lower()
-        for key, data in plugins.items():
+        for key, data in self._iter_market_plugin_items(plugins):
             desc = str(data.get("desc") or "")
             display_name = str(data.get("display_name") or key)
             if (
@@ -161,8 +181,7 @@ class PluginFinderService:
         exact_matches: list[tuple[str, dict]] = []
         fuzzy_matches: list[tuple[str, dict]] = []
 
-        for key, data in plugins.items():
-            key_str = str(key)
+        for key_str, data in self._iter_market_plugin_items(plugins):
             display_name = str(data.get("display_name") or key_str)
             repo_name = str(data.get("repo") or "").rstrip("/").split("/")[-1]
 
@@ -210,10 +229,12 @@ class PluginFinderService:
 
     @staticmethod
     def _extract_safe_repo_name(repo_url: str) -> str | None:
-        path = (urlparse(repo_url).path or "").rstrip("/")
-        if not path:
+        parsed = urlparse(repo_url)
+        path_segments = [seg for seg in (parsed.path or "").split("/") if seg]
+        if len(path_segments) != 2:
             return None
-        repo_name = path.split("/")[-1]
+
+        repo_name = path_segments[-1]
         if repo_name.endswith(".git"):
             repo_name = repo_name[:-4]
         if repo_name in {"", ".", ".."}:
@@ -221,6 +242,71 @@ class PluginFinderService:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", repo_name):
             return None
         return repo_name
+
+    @staticmethod
+    def _canonical_repo_identity(repo_url: str) -> str | None:
+        repo_url = (repo_url or "").strip()
+        if not repo_url:
+            return None
+
+        # 支持 git@host:owner/repo(.git) 形式
+        ssh_match = re.fullmatch(
+            r"git@([^:]+):([^/]+)/([^/]+?)(?:\\.git)?",
+            repo_url,
+        )
+        if ssh_match:
+            host = ssh_match.group(1).lower()
+            owner = ssh_match.group(2)
+            repo = ssh_match.group(3)
+            if repo.endswith(".git"):
+                repo = repo[:-4]
+        else:
+            parsed = urlparse(repo_url)
+            host = (parsed.hostname or "").lower()
+            path_segments = [seg for seg in (parsed.path or "").split("/") if seg]
+            if parsed.scheme not in {"http", "https", "ssh", "git"} or len(path_segments) != 2:
+                return None
+            owner, repo = path_segments[0], path_segments[1]
+            if repo.endswith(".git"):
+                repo = repo[:-4]
+
+        if not host or not re.fullmatch(r"[A-Za-z0-9._-]+", owner) or not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
+            return None
+
+        return f"{host}/{owner.lower()}/{repo.lower()}"
+
+    async def _verify_git_origin(
+        self,
+        target_dir: str,
+        expected_repo_url: str,
+        report_lines: list[str],
+    ) -> str | None:
+        code, out, err = await self._run_cmd(
+            self.config.git_bin,
+            "config",
+            "--get",
+            "remote.origin.url",
+            cwd=target_dir,
+            timeout_sec=self.config.git_timeout_sec,
+        )
+        report_lines.append(f"git config remote.origin.url 返回码: {code}")
+        if code != 0:
+            report_lines.append(f"读取 origin 失败: {self._shorten(err)}")
+            return "[INSTALL_FAIL] 目标目录的 Git origin 不可读，已阻止在未知仓库上更新。"
+
+        current_origin = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
+        report_lines.append(f"当前 origin: {current_origin}")
+        expected_id = self._canonical_repo_identity(expected_repo_url)
+        current_id = self._canonical_repo_identity(current_origin)
+        if not expected_id or not current_id:
+            report_lines.append("origin 规范化失败。")
+            return "[INSTALL_FAIL] 无法确认目标仓库身份，已阻止更新。"
+
+        if expected_id != current_id:
+            report_lines.append(f"origin 不匹配 expected={expected_id}, current={current_id}")
+            return "[INSTALL_FAIL] 目标目录仓库来源与待安装插件不一致，已阻止更新。"
+
+        return None
 
     def _new_install_report(self, plugin_name: str) -> list[str]:
         return [
@@ -382,6 +468,10 @@ class PluginFinderService:
                     )
 
             if os.path.exists(target_dir):
+                origin_error = await self._verify_git_origin(target_dir, repo_url, report_lines)
+                if origin_error:
+                    return origin_error
+
                 await event.send(event.plain_result("📦 目录已存在，执行 git pull 更新..."))
                 code, out, err = await self._run_cmd(
                     self.config.git_bin,
@@ -433,11 +523,27 @@ class PluginFinderService:
         self,
         event: AstrMessageEvent,
         target_dir: str,
+        plugin_key: str,
         report_lines: list[str],
     ) -> str | None:
         req_file = os.path.join(target_dir, "requirements.txt")
         if self.config.pip_install_requirements and os.path.exists(req_file):
+            if plugin_key not in self.config.trusted_requirements_plugins:
+                report_lines.append(
+                    "requirements.txt 存在，但该插件不在 trusted_requirements_plugins 白名单，已跳过自动安装。"
+                )
+                return (
+                    "[INSTALL_PARTIAL] 已下载插件代码，但出于供应链安全考虑，"
+                    "该插件不在依赖自动安装白名单，已跳过 pip install。"
+                    "\n请人工确认后手动安装依赖，并执行 /plugin reload。"
+                )
+
             try:
+                await event.send(
+                    event.plain_result(
+                        "⚠ 将安装第三方依赖（来自 requirements.txt），请确认来源可信。"
+                    )
+                )
                 await event.send(event.plain_result("🧩 检测到 requirements.txt，执行 pip install..."))
                 code, out, err = await self._run_cmd(
                     sys.executable,
@@ -473,6 +579,19 @@ class PluginFinderService:
         target_data: dict,
         report_lines: list[str],
     ) -> str:
+        def _resolve_reload_manager():
+            for attr in ("star_manager", "plugin_manager"):
+                manager_obj = getattr(self.context, attr, None)
+                if manager_obj is not None and hasattr(manager_obj, "reload"):
+                    return manager_obj, f"context.{attr}"
+
+            manager_obj = getattr(self.context, "_star_manager", None)
+            if manager_obj is not None and hasattr(manager_obj, "reload"):
+                logger.warning("使用私有属性 _star_manager 作为兼容回退。")
+                return manager_obj, "context._star_manager"
+
+            return None, ""
+
         reload_success = False
         reload_errors = []
         if not self.config.auto_reload_after_install:
@@ -485,9 +604,10 @@ class PluginFinderService:
             )
 
         try:
-            if hasattr(self.context, "_star_manager"):
+            manager, manager_source = _resolve_reload_manager()
+            if manager is not None:
+                report_lines.append(f"重载管理器来源: {manager_source}")
                 await event.send(event.plain_result("🔄 正在刷新插件列表..."))
-                manager = self.context._star_manager
 
                 try:
                     result = await manager.reload(repo_name)
@@ -533,10 +653,10 @@ class PluginFinderService:
                     "\n如需审计明细，可发送 /查看安装日志",
                 )
 
-            report_lines.append("当前版本未暴露 _star_manager。")
+            report_lines.append("当前版本未找到可用重载管理器（公开 API 或兼容回退均不可用）。")
             return self._save_and_return(
                 report_lines,
-                "[INSTALL_PARTIAL] 代码已下载，但当前版本不支持静默热重载。"
+                "[INSTALL_PARTIAL] 代码已下载，但当前版本未找到可用的公开重载管理器。"
                 "\n请手动执行 /plugin reload 后在 WebUI 查看。",
             )
         except Exception as e:
@@ -553,6 +673,10 @@ class PluginFinderService:
         plugin_name: str,
         has_user_confirmed: bool,
     ) -> str:
+        plugin_name = (plugin_name or "").strip()
+        if not plugin_name:
+            return "[INSTALL_FAIL] 插件名为空，请提供 search 返回的完整 plugin_name。"
+
         if not has_user_confirmed:
             report_lines = [
                 f"时间: {datetime.now().isoformat(timespec='seconds')}",
@@ -611,7 +735,7 @@ class PluginFinderService:
         if error:
             return self._save_and_return(report_lines, error)
 
-        error = await self._install_plugin_requirements(event, target_dir, report_lines)
+        error = await self._install_plugin_requirements(event, target_dir, target_key, report_lines)
         if error:
             return self._save_and_return(report_lines, error)
 
