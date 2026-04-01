@@ -1,5 +1,7 @@
-﻿import os
+﻿import json
+import os
 
+from astrbot.api import logger
 from astrbot.api.all import Context, AstrMessageEvent
 from astrbot.api.event import filter
 from astrbot.api.star import register, Star
@@ -16,7 +18,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.8",
+    "1.1.9",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -31,6 +33,23 @@ class PluginFinder(Star):
             plugins_root=plugins_root,
         )
 
+    @staticmethod
+    def _format_search_results(results: list[dict]) -> str:
+        payload = {
+            "total": len(results),
+            "items": [
+                {
+                    "plugin_name": item.get("plugin_name", ""),
+                    "display_name": item.get("display_name", ""),
+                    "description": item.get("description", ""),
+                    "repo_url": item.get("repo_url", ""),
+                }
+                for item in results
+            ],
+            "next_step": "请结合上面候选向用户推荐，并明确询问‘是否需要我现在安装其中某个插件？’",
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
     @filter.llm_tool(name="search_astrbot_plugin")
     async def search_plugin(self, event: AstrMessageEvent, search_keyword: str):
         """当用户想要查找、安装某种功能的插件时，使用此工具去官方市场搜索。
@@ -38,14 +57,15 @@ class PluginFinder(Star):
         请务必在回答的最后明确询问用户：“找到了这些插件，是否需要为您安装？”（请使用真实查询到的名称，不要自己编造）。
         禁止在未调用 install_astrbot_plugin 前向用户声称“已经安装成功”。
         """
-        results = await self.service.search_plugins(search_keyword)
-        if not results:
-            return f"未找到与 '{search_keyword}' 有关的插件。请告诉用户需要换个关键词试试。"
+        try:
+            results = await self.service.search_plugins(search_keyword)
+            if not results:
+                return f"未找到与 '{search_keyword}' 有关的插件。请告诉用户需要换个关键词试试。"
 
-        return (
-            "找到了以下匹配的插件，请向用户推荐并明确询问'要安装其中哪个插件吗？'\n"
-            + str(results)
-        )
+            return self._format_search_results(results)
+        except Exception as e:
+            logger.error(f"search_plugin 执行失败: {e}")
+            return "[SEARCH_FAIL] 检索插件时发生异常，请稍后重试。"
 
     @filter.llm_tool(name="install_astrbot_plugin")
     async def install_plugin_tool(
@@ -59,11 +79,15 @@ class PluginFinder(Star):
         【极其重要】：如果用户没有明确同意安装，必须将 has_user_confirmed 设置为 False！
         如果由于任何原因你不确定用户是否同意，也设为 False！
         """
-        return await self.service.install_plugin_tool(
-            event=event,
-            plugin_name=plugin_name,
-            has_user_confirmed=has_user_confirmed,
-        )
+        try:
+            return await self.service.install_plugin_tool(
+                event=event,
+                plugin_name=plugin_name,
+                has_user_confirmed=has_user_confirmed,
+            )
+        except Exception as e:
+            logger.error(f"install_plugin_tool 执行失败: {e}")
+            return "[INSTALL_FAIL] 安装流程执行异常，请稍后重试。"
 
     @filter.command("查看安装日志")
     async def show_install_log(self, event: AstrMessageEvent):
@@ -98,5 +122,9 @@ class PluginFinder(Star):
             return
 
         yield event.plain_result(f"执行直接安装命令: {plugin_keyword}...")
-        result = await self.service.install_plugin_tool(event, plugin_keyword, True)
-        yield event.plain_result(result)
+        try:
+            result = await self.service.install_plugin_tool(event, plugin_keyword, True)
+            yield event.plain_result(result)
+        except Exception as e:
+            logger.error(f"cmd_direct_install 执行失败: {e}")
+            yield event.plain_result("[INSTALL_FAIL] 直接安装流程异常，请稍后重试。")

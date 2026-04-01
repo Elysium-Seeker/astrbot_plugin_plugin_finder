@@ -36,10 +36,28 @@ def _cfg(plugin_config, key: str, default):
 def _as_bool(value, default: bool) -> bool:
     if isinstance(value, bool):
         return value
+
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+
+        logger.warning(f"布尔配置解析失败 value={value}，已回退默认值 {default}")
+        return default
+
     if isinstance(value, (int, float)):
-        return bool(value)
+        if value in {0, 1}:
+            return bool(value)
+
+        logger.warning(f"布尔配置仅接受 0/1 数值 value={value}，已回退默认值 {default}")
+        return default
+
+    if value is None:
+        return default
+
+    logger.warning(f"布尔配置类型不支持 value={value}，已回退默认值 {default}")
     return default
 
 
@@ -56,7 +74,7 @@ def _as_int(value, default: int) -> int:
         return default
 
 
-def _parse_host_allowlist(value) -> set[str]:
+def _parse_host_allowlist(value, fallback_hosts: set[str] | None = None) -> set[str]:
     raw_items: list[str] = []
     if isinstance(value, str):
         raw_items = [i.strip().lower() for i in value.split(",")]
@@ -70,8 +88,13 @@ def _parse_host_allowlist(value) -> set[str]:
         and host not in {".", ".."}
         and re.fullmatch(r"[a-z0-9.-]+", host)
     }
-    # 防止误配置成空白名单导致全部安装都被阻断。
-    return safe_hosts or {"github.com"}
+    if safe_hosts:
+        return safe_hosts
+
+    if fallback_hosts:
+        return set(fallback_hosts)
+
+    return {"github.com"}
 
 
 def _parse_plugin_allowlist(value) -> set[str]:
@@ -103,6 +126,16 @@ def _is_allowed_host(url: str, allowed_hosts: set[str]) -> bool:
     return any(host.endswith(f".{allowed}") for allowed in allowed_hosts)
 
 
+def _build_market_fallback_url(allowed_hosts: set[str], fallback_url: str) -> str:
+    try:
+        fallback_path = urlparse(fallback_url).path or "/astrbot/plugins"
+    except Exception:
+        fallback_path = "/astrbot/plugins"
+
+    fallback_host = sorted(allowed_hosts)[0] if allowed_hosts else "api.soulter.top"
+    return f"https://{fallback_host}{fallback_path}"
+
+
 def _validate_market_api_url(
     raw_url: str,
     allowed_hosts: set[str],
@@ -111,17 +144,27 @@ def _validate_market_api_url(
     if _is_allowed_host(raw_url, allowed_hosts):
         return raw_url
 
+    if _is_allowed_host(fallback_url, allowed_hosts):
+        logger.warning(
+            "market_api_url 不在允许范围内或协议非法，已回退默认地址。"
+            f" raw={raw_url}, fallback={fallback_url}, allowed_hosts={sorted(allowed_hosts)}"
+        )
+        return fallback_url
+
+    rebuilt_fallback = _build_market_fallback_url(allowed_hosts, fallback_url)
+
     logger.warning(
-        "market_api_url 不在允许范围内或协议非法，已回退默认地址。"
-        f" raw={raw_url}, allowed_hosts={sorted(allowed_hosts)}"
+        "market_api_url 与 fallback_url 均不在白名单内，已使用白名单首域名重建回退地址。"
+        f" raw={raw_url}, fallback={fallback_url}, rebuilt={rebuilt_fallback}, allowed_hosts={sorted(allowed_hosts)}"
     )
-    return fallback_url
+    return rebuilt_fallback
 
 
 def load_plugin_finder_config(plugin_config) -> PluginFinderConfig:
     default_market_api_url = "https://api.soulter.top/astrbot/plugins"
     allowed_market_api_hosts = _parse_host_allowlist(
-        _cfg(plugin_config, "allowed_market_api_hosts", "api.soulter.top")
+        _cfg(plugin_config, "allowed_market_api_hosts", "api.soulter.top"),
+        fallback_hosts={"api.soulter.top"},
     )
     raw_market_api_url = str(
         _cfg(plugin_config, "market_api_url", default_market_api_url)
@@ -161,7 +204,8 @@ def load_plugin_finder_config(plugin_config) -> PluginFinderConfig:
         ),
         recover_non_git_dir=_as_bool(_cfg(plugin_config, "recover_non_git_dir", True), True),
         allowed_repo_hosts=_parse_host_allowlist(
-            _cfg(plugin_config, "allowed_repo_hosts", "github.com")
+            _cfg(plugin_config, "allowed_repo_hosts", "github.com"),
+            fallback_hosts={"github.com"},
         ),
         direct_install_confirm_phrase=direct_install_confirm_phrase,
     )

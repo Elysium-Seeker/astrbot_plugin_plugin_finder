@@ -216,63 +216,92 @@ class PluginFinderService:
 
         return None, None, []
 
-    def _is_allowed_repo_host(self, repo_url: str) -> bool:
-        try:
-            host = (urlparse(repo_url).hostname or "").strip().lower()
-        except Exception:
-            return False
-        if not host:
-            return False
-        if host in self.config.allowed_repo_hosts:
-            return True
-        return any(host.endswith(f".{allowed}") for allowed in self.config.allowed_repo_hosts)
-
     @staticmethod
-    def _extract_safe_repo_name(repo_url: str) -> str | None:
-        parsed = urlparse(repo_url)
-        path_segments = [seg for seg in (parsed.path or "").split("/") if seg]
-        if len(path_segments) != 2:
-            return None
-
-        repo_name = path_segments[-1]
-        if repo_name.endswith(".git"):
-            repo_name = repo_name[:-4]
-        if repo_name in {"", ".", ".."}:
-            return None
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", repo_name):
-            return None
-        return repo_name
-
-    @staticmethod
-    def _canonical_repo_identity(repo_url: str) -> str | None:
+    def _normalize_repo_url(repo_url: str) -> str | None:
         repo_url = (repo_url or "").strip()
         if not repo_url:
             return None
 
-        # 支持 git@host:owner/repo(.git) 形式
-        ssh_match = re.fullmatch(
-            r"git@([^:]+):([^/]+)/([^/]+?)(?:\\.git)?",
-            repo_url,
-        )
-        if ssh_match:
-            host = ssh_match.group(1).lower()
-            owner = ssh_match.group(2)
-            repo = ssh_match.group(3)
-            if repo.endswith(".git"):
-                repo = repo[:-4]
-        else:
-            parsed = urlparse(repo_url)
-            host = (parsed.hostname or "").lower()
-            path_segments = [seg for seg in (parsed.path or "").split("/") if seg]
-            if parsed.scheme not in {"http", "https", "ssh", "git"} or len(path_segments) != 2:
-                return None
-            owner, repo = path_segments[0], path_segments[1]
-            if repo.endswith(".git"):
-                repo = repo[:-4]
+        if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\.git)?", repo_url):
+            return f"https://github.com/{repo_url}"
 
-        if not host or not re.fullmatch(r"[A-Za-z0-9._-]+", owner) or not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
+        if repo_url.startswith("git@"):
+            return repo_url
+
+        parsed = urlparse(repo_url)
+        if parsed.scheme in {"http", "https", "ssh", "git"} and parsed.hostname:
+            return repo_url
+
+        return None
+
+    @staticmethod
+    def _parse_repo_components(repo_url: str) -> tuple[str, str, str] | None:
+        repo_url = (repo_url or "").strip()
+        if not repo_url:
             return None
 
+        if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\.git)?", repo_url):
+            owner, repo = repo_url.split("/", 1)
+            host = "github.com"
+        elif repo_url.startswith("git@"):
+            _, _, ssh_target = repo_url.partition("@")
+            host, separator, path = ssh_target.partition(":")
+            if not separator:
+                return None
+
+            path_segments = [seg for seg in path.split("/") if seg]
+            if len(path_segments) != 2:
+                return None
+            owner, repo = path_segments
+        else:
+            parsed = urlparse(repo_url)
+            if parsed.scheme not in {"http", "https", "ssh", "git"}:
+                return None
+
+            host = (parsed.hostname or "").strip().lower()
+            path_segments = [seg for seg in (parsed.path or "").split("/") if seg]
+            if len(path_segments) != 2:
+                return None
+            owner, repo = path_segments
+
+        host = host.strip().lower()
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+
+        if not host or owner in {"", ".", ".."} or repo in {"", ".", ".."}:
+            return None
+        if not re.fullmatch(r"[a-z0-9.-]+", host):
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", owner):
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
+            return None
+
+        return host, owner, repo
+
+    def _is_allowed_repo_host(self, repo_url: str) -> bool:
+        parsed = self._parse_repo_components(repo_url)
+        if not parsed:
+            return False
+
+        host = parsed[0]
+        if host in self.config.allowed_repo_hosts:
+            return True
+        return any(host.endswith(f".{allowed}") for allowed in self.config.allowed_repo_hosts)
+
+    def _extract_safe_repo_name(self, repo_url: str) -> str | None:
+        parsed = self._parse_repo_components(repo_url)
+        if not parsed:
+            return None
+
+        return parsed[2]
+
+    def _canonical_repo_identity(self, repo_url: str) -> str | None:
+        parsed = self._parse_repo_components(repo_url)
+        if not parsed:
+            return None
+
+        host, owner, repo = parsed
         return f"{host}/{owner.lower()}/{repo.lower()}"
 
     async def _verify_git_origin(
@@ -352,8 +381,8 @@ class PluginFinderService:
                 f"[INSTALL_FAIL] 安装失败：在市场中未找到名为 {plugin_name} 的合法插件。",
             )
 
-        repo_url = str(target_data.get("repo") or "").strip()
-        if not repo_url:
+        raw_repo_url = str(target_data.get("repo") or "").strip()
+        if not raw_repo_url:
             report_lines.append(f"匹配成功但 repo 为空，插件键: {target_key}")
             return (
                 None,
@@ -364,8 +393,17 @@ class PluginFinderService:
                 f"[INSTALL_FAIL] 安装失败：插件 {target_key} 缺少仓库地址。",
             )
 
-        if not repo_url.startswith("http"):
-            repo_url = f"https://github.com/{repo_url}"
+        repo_url = self._normalize_repo_url(raw_repo_url)
+        if not repo_url:
+            report_lines.append(f"仓库地址格式不支持: {raw_repo_url}")
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[INSTALL_FAIL] 仓库地址格式不合法，已阻止安装。",
+            )
 
         if not self._is_allowed_repo_host(repo_url):
             report_lines.append(f"仓库域名不在白名单内: {repo_url}")
@@ -585,11 +623,6 @@ class PluginFinderService:
                 if manager_obj is not None and hasattr(manager_obj, "reload"):
                     return manager_obj, f"context.{attr}"
 
-            manager_obj = getattr(self.context, "_star_manager", None)
-            if manager_obj is not None and hasattr(manager_obj, "reload"):
-                logger.warning("使用私有属性 _star_manager 作为兼容回退。")
-                return manager_obj, "context._star_manager"
-
             return None, ""
 
         reload_success = False
@@ -677,21 +710,23 @@ class PluginFinderService:
         if not plugin_name:
             return "[INSTALL_FAIL] 插件名为空，请提供 search 返回的完整 plugin_name。"
 
-        if not has_user_confirmed:
-            report_lines = [
-                f"时间: {datetime.now().isoformat(timespec='seconds')}",
-                f"用户输入: {plugin_name}",
-                "用户未确认安装，流程终止。",
-            ]
-            self._last_install_report = "\n".join(report_lines)
-            return "[INSTALL_BLOCKED] 执行已被拒绝：请先向用户询问并确认安装，再调用此工具。"
-
         if self._install_lock.locked():
             await event.send(
                 event.plain_result("⏳ 当前有其他安装任务执行中，已加入队列，请稍候..."),
             )
 
         async with self._install_lock:
+            if not has_user_confirmed:
+                report_lines = [
+                    f"时间: {datetime.now().isoformat(timespec='seconds')}",
+                    f"用户输入: {plugin_name}",
+                    "用户未确认安装，流程终止。",
+                ]
+                return self._save_and_return(
+                    report_lines,
+                    "[INSTALL_BLOCKED] 执行已被拒绝：请先向用户询问并确认安装，再调用此工具。",
+                )
+
             return await self._install_plugin_tool_locked(event, plugin_name)
 
     async def _install_plugin_tool_locked(
