@@ -531,6 +531,10 @@ class PluginFinderService:
                 code, out, err = await self._run_cmd(
                     self.config.git_bin,
                     "clone",
+                    "--depth",
+                    "1",
+                    "--single-branch",
+                    "--no-tags",
                     repo_url,
                     target_dir,
                     timeout_sec=self.config.git_timeout_sec,
@@ -775,6 +779,14 @@ class PluginFinderService:
 
         report_lines = self._new_install_report(plugin_name)
 
+        if self._install_lock.locked():
+            report_lines.append("检测到安装互斥锁占用，已快速失败避免工具调用排队超时。")
+            return self._save_and_return(
+                report_lines,
+                "[INSTALL_BUSY] 当前已有安装任务在执行，为避免 60 秒工具超时，本次请求未排队。"
+                "\n请等待上一任务完成后重试，或使用 /查看安装日志 查看进度。",
+            )
+
         await event.send(
             event.plain_result(
                 f"⏳ 收到确认，开始为您安装插件：{plugin_name}，请稍候..."
@@ -808,15 +820,6 @@ class PluginFinderService:
             return self._save_and_return(
                 report_lines,
                 "[INSTALL_FAIL] 安装目标解析异常，请稍后重试。",
-            )
-
-        error = await self._verify_repo_reachable(event, repo_url, report_lines)
-        if error:
-            return self._save_and_return(report_lines, error)
-
-        if self._install_lock.locked():
-            await event.send(
-                event.plain_result("⏳ 当前有其他安装任务执行中，等待进入安装阶段..."),
             )
 
         async with self._install_lock:
