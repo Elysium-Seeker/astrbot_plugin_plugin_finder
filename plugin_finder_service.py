@@ -165,11 +165,11 @@ class PluginFinderService:
 
     def _infer_plugin_name_from_recent_search(self) -> tuple[str, str]:
         if not self._last_search_plugin_names or self._last_search_at is None:
-            return "", "[INSTALL_FAIL] 插件名为空，且无可用的最近搜索记录。请先执行搜索并提供完整 plugin_name。"
+            return "", "[INSTALL_FAIL] 插件名为空，请提供完整 plugin_name（例如 astrbot_plugin_echo）。"
 
         age_seconds = (datetime.now() - self._last_search_at).total_seconds()
         if age_seconds > 600:
-            return "", "[INSTALL_FAIL] 插件名为空，且最近搜索记录已过期。请重新搜索后再安装。"
+            return "", "[INSTALL_FAIL] 插件名为空，请提供完整 plugin_name（例如 astrbot_plugin_echo）。"
 
         if len(self._last_search_plugin_names) == 1:
             return self._last_search_plugin_names[0], ""
@@ -177,7 +177,7 @@ class PluginFinderService:
         candidates = ", ".join(self._last_search_plugin_names[:5])
         return (
             "",
-            "[INSTALL_BLOCKED] 插件名为空，最近搜索包含多个候选，无法自动判定。"
+            "[INSTALL_BLOCKED] 插件名为空且候选不唯一，无法自动判定。"
             "\n请使用 search 返回的完整 plugin_name。"
             f"\n候选: {candidates}",
         )

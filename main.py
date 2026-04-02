@@ -1,5 +1,6 @@
 ﻿import json
 import os
+import re
 import asyncio
 
 from astrbot.api import logger
@@ -19,7 +20,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.18",
+    "1.1.19",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -74,6 +75,142 @@ class PluginFinder(Star):
             text = str(value).strip()
             if text:
                 return text
+        return ""
+
+    @staticmethod
+    def _extract_plugin_name_token(text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+
+        match = re.search(r"(astrbot[_-]plugin[_-][A-Za-z0-9._-]+)", raw, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+        normalized = raw.strip("\"' ")
+        if (
+            normalized
+            and "plugin" in normalized.lower()
+            and re.fullmatch(r"[A-Za-z0-9._-]+", normalized)
+        ):
+            return normalized
+
+        return ""
+
+    @staticmethod
+    def _collect_string_values(value, *, depth: int = 0) -> list[str]:
+        if depth > 4:
+            return []
+
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+
+            collected = [text]
+            if text[:1] in {"{", "["}:
+                try:
+                    parsed = json.loads(text)
+                    collected.extend(
+                        PluginFinder._collect_string_values(parsed, depth=depth + 1)
+                    )
+                except Exception:
+                    pass
+            return collected
+
+        if isinstance(value, dict):
+            collected: list[str] = []
+            for key, item in value.items():
+                collected.extend(PluginFinder._collect_string_values(key, depth=depth + 1))
+                collected.extend(PluginFinder._collect_string_values(item, depth=depth + 1))
+            return collected
+
+        if isinstance(value, (list, tuple, set)):
+            collected: list[str] = []
+            for item in value:
+                collected.extend(PluginFinder._collect_string_values(item, depth=depth + 1))
+            return collected
+
+        return [str(value)]
+
+    @staticmethod
+    def _extract_plugin_name_from_kwargs(kwargs: dict) -> str:
+        if not kwargs:
+            return ""
+
+        direct_keys = (
+            "plugin_name",
+            "plugin",
+            "name",
+            "plugin_keyword",
+            "target_plugin",
+            "pluginName",
+            "plugin_name_or_keyword",
+            "selected_plugin_name",
+            "selectedPlugin",
+            "plugin_id",
+            "id",
+            "candidate",
+            "selection",
+            "query",
+            "search_keyword",
+            "keyword",
+        )
+
+        for key in direct_keys:
+            if key not in kwargs:
+                continue
+            token = PluginFinder._extract_plugin_name_token(str(kwargs.get(key) or ""))
+            if token:
+                return token
+
+        tokens: list[str] = []
+        for text in PluginFinder._collect_string_values(kwargs):
+            token = PluginFinder._extract_plugin_name_token(text)
+            if token and token not in tokens:
+                tokens.append(token)
+
+        if len(tokens) == 1:
+            return tokens[0]
+
+        return ""
+
+    @staticmethod
+    def _extract_plugin_name_from_event(event: AstrMessageEvent) -> str:
+        possible_attrs = (
+            "message_str",
+            "message",
+            "raw_message",
+            "content",
+            "text",
+        )
+
+        texts: list[str] = []
+        for attr in possible_attrs:
+            try:
+                value = getattr(event, attr, None)
+            except Exception:
+                continue
+
+            if value is None:
+                continue
+
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+
+            texts.extend(PluginFinder._collect_string_values(value))
+
+        for text in texts:
+            token = PluginFinder._extract_plugin_name_token(text)
+            if token:
+                return token
+
         return ""
 
     @staticmethod
@@ -135,17 +272,10 @@ class PluginFinder(Star):
         """用户明确确认后执行安装；必须传 plugin_name，未确认时 has_user_confirmed 必须为 False。"""
         try:
             if not (plugin_name or "").strip() and kwargs:
-                plugin_name = self._pick_first_non_empty(
-                    kwargs,
-                    (
-                        "plugin_name",
-                        "plugin",
-                        "name",
-                        "plugin_keyword",
-                        "target_plugin",
-                        "pluginName",
-                    ),
-                )
+                plugin_name = self._extract_plugin_name_from_kwargs(kwargs)
+
+            if not (plugin_name or "").strip():
+                plugin_name = self._extract_plugin_name_from_event(event)
 
             confirmed_value = has_user_confirmed
             if kwargs:
