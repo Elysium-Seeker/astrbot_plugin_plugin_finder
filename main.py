@@ -20,7 +20,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.21",
+    "1.1.22",
 )
 class PluginFinder(Star):
     _INVALID_PLUGIN_LITERALS = {
@@ -136,6 +136,11 @@ class PluginFinder(Star):
             and lowered not in PluginFinder._INVALID_PLUGIN_LITERALS
         ):
             return normalized
+
+        # Keep a permissive fallback for direct tool arguments,
+        # then let service-level matching decide exact target.
+        if normalized and lowered not in PluginFinder._INVALID_PLUGIN_LITERALS:
+            return normalized[:120]
 
         return ""
 
@@ -355,6 +360,11 @@ class PluginFinder(Star):
         if re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9._-]{1,20}", raw):
             return raw
 
+        # Do not over-filter: keep non-empty keyword as fallback
+        # unless it is an obvious structural/control literal.
+        if lowered not in PluginFinder._INVALID_SEARCH_LITERALS:
+            return raw[:120]
+
         return ""
 
     @staticmethod
@@ -471,7 +481,11 @@ class PluginFinder(Star):
         search_keyword: str = "",
         **kwargs,
     ):
-        """搜索官方市场插件，返回精简候选列表（含安装所需 plugin_name）。"""
+        """搜索官方市场插件并返回候选。
+
+        Args:
+            search_keyword (str): 搜索关键词，可为功能词或插件名。
+        """
         try:
             if not (search_keyword or "").strip() and kwargs:
                 search_keyword = self._extract_search_keyword_from_kwargs(kwargs)
@@ -498,10 +512,15 @@ class PluginFinder(Star):
         self,
         event: AstrMessageEvent,
         plugin_name: str = "",
-        has_user_confirmed=False,
+        has_user_confirmed: bool = False,
         **kwargs,
     ):
-        """用户明确确认后执行安装；必须传 plugin_name，未确认时 has_user_confirmed 必须为 False。"""
+        """用户明确确认后执行安装。
+
+        Args:
+            plugin_name (str): 目标插件名，建议传 search 返回的完整 plugin_name。
+            has_user_confirmed (bool): 用户是否明确确认安装。
+        """
         try:
             if not (plugin_name or "").strip() and kwargs:
                 plugin_name = self._extract_plugin_name_from_kwargs(kwargs)
