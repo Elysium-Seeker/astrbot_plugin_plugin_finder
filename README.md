@@ -13,6 +13,8 @@
 
 ## 🆕 最近更新
 
+- `v1.1.23`：增强自动重载管理器兼容：新增 context._star_manager 与类级 _star_manager 回退；补充嵌套上下文路径检测（context/_context/core_lifecycle）提升管理器发现率；兼容同步/异步 reload 调用，避免因调用形态差异导致热重载失败。
+
 - `v1.1.22`：修复 agent 调用工具传参被过度过滤的问题：搜索关键词增加宽松回退策略；修复安装参数提取：plugin_name 允许普通文本回退并交由服务层匹配；恢复 llm_tool 的 Args 风格文档并明确 has_user_confirmed 类型，提升参数识别稳定性。
 
 - `v1.1.21`：修复发布脚本：提交前自动清理 __pycache__，防止缓存文件被误提交；新增 .gitignore 忽略 __pycache__/ 与 *.pyc；清理上一版误入库的 __pycache__ 缓存文件。

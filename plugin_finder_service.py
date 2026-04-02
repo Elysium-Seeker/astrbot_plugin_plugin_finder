@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import os
 import re
 import sys
@@ -935,12 +936,58 @@ class PluginFinderService:
         report_lines: list[str],
     ) -> str:
         def _resolve_reload_manager():
-            for attr in ("star_manager", "plugin_manager"):
-                manager_obj = getattr(self.context, attr, None)
-                if manager_obj is not None and hasattr(manager_obj, "reload"):
-                    return manager_obj, f"context.{attr}"
+            checked_ids: set[int] = set()
+
+            def _pick_if_reloadable(obj, source: str):
+                if obj is None:
+                    return None
+                obj_id = id(obj)
+                if obj_id in checked_ids:
+                    return None
+                checked_ids.add(obj_id)
+
+                reload_attr = getattr(obj, "reload", None)
+                if callable(reload_attr):
+                    return obj, source
+                return None
+
+            direct_attrs = ("star_manager", "plugin_manager", "_star_manager")
+            for attr in direct_attrs:
+                picked = _pick_if_reloadable(getattr(self.context, attr, None), f"context.{attr}")
+                if picked:
+                    return picked
+
+            # Some AstrBot versions keep backward-compat manager on Context class var.
+            picked = _pick_if_reloadable(
+                getattr(type(self.context), "_star_manager", None),
+                "type(context)._star_manager",
+            )
+            if picked:
+                return picked
+
+            for parent_attr in ("context", "_context", "core_lifecycle"):
+                parent = getattr(self.context, parent_attr, None)
+                if parent is None:
+                    continue
+                for attr in direct_attrs:
+                    picked = _pick_if_reloadable(
+                        getattr(parent, attr, None),
+                        f"context.{parent_attr}.{attr}",
+                    )
+                    if picked:
+                        return picked
 
             return None, ""
+
+        async def _call_manager_reload(manager_obj, *args):
+            reload_func = getattr(manager_obj, "reload", None)
+            if not callable(reload_func):
+                raise RuntimeError("重载管理器缺少可调用的 reload")
+
+            result = reload_func(*args)
+            if inspect.isawaitable(result):
+                return await result
+            return result
 
         reload_success = False
         reload_errors = []
@@ -966,7 +1013,7 @@ class PluginFinderService:
                 await event.send(event.plain_result("🔄 正在刷新插件列表..."))
 
                 try:
-                    result = await manager.reload(repo_name)
+                    result = await _call_manager_reload(manager, repo_name)
                     reload_success, reload_err = self._parse_reload_result(result)
                     report_lines.append(f"reload({repo_name}) 结果: {result}")
                     if not reload_success and reload_err:
@@ -980,7 +1027,7 @@ class PluginFinderService:
 
                 if not reload_success and self.config.full_reload_fallback:
                     try:
-                        result = await manager.reload()
+                        result = await _call_manager_reload(manager)
                         reload_success, reload_err = self._parse_reload_result(result)
                         report_lines.append(f"reload() 结果: {result}")
                         if not reload_success and reload_err:
