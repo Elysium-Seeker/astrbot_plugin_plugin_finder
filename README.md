@@ -13,6 +13,8 @@
 
 ## 🆕 最近更新
 
+- `v1.1.20`：修复 search_astrbot_plugin 参数提取：支持 kwargs 深层结构和嵌套 JSON；新增搜索关键词事件文本兜底，降低参数丢失时的失败概率；修复递归提取会污染键名的问题：仅提取值并过滤保留字段；同步加固 plugin_name 提取在嵌套结构下的稳定性。
+
 - `v1.1.19`：加固安装参数读取：支持 kwargs 深层结构与嵌套 JSON 自动提取 plugin_name；新增事件文本兜底提取 plugin_name，降低对最近搜索状态的依赖；优化插件名为空报错语义，避免误导为强依赖最近搜索记录；修正文档中的 release_push.ps1 调用示例为 PowerShell 数组语法。
 
 - `v1.1.18`：修复安装阶段 plugin_name 为空时的兜底逻辑：支持最近搜索唯一候选自动补全；多候选场景改为 INSTALL_BLOCKED 并返回候选列表，避免误装；发布脚本改为 git add -A，避免代码改动漏提交；修复 release_push.ps1 在 PowerShell 下的版本解析稳定性。

@@ -20,9 +20,49 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.19",
+    "1.1.20",
 )
 class PluginFinder(Star):
+    _INVALID_PLUGIN_LITERALS = {
+        "plugin",
+        "plugin_name",
+        "pluginname",
+        "plugin_keyword",
+        "target_plugin",
+        "name",
+        "args",
+        "kwargs",
+        "search_astrbot_plugin",
+        "install_astrbot_plugin",
+    }
+
+    _INVALID_SEARCH_LITERALS = {
+        "search",
+        "search_keyword",
+        "searchkeyword",
+        "search_astrbot_plugin",
+        "install_astrbot_plugin",
+        "keyword",
+        "query",
+        "name",
+        "plugin",
+        "plugin_name",
+        "pluginname",
+        "plugin_keyword",
+        "has_user_confirmed",
+        "user_confirmed",
+        "confirmed",
+        "is_confirmed",
+        "args",
+        "kwargs",
+        "true",
+        "false",
+        "yes",
+        "no",
+        "ok",
+        "confirm",
+    }
+
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = load_plugin_finder_config(config or {})
@@ -88,10 +128,12 @@ class PluginFinder(Star):
             return match.group(1)
 
         normalized = raw.strip("\"' ")
+        lowered = normalized.lower()
         if (
             normalized
             and "plugin" in normalized.lower()
             and re.fullmatch(r"[A-Za-z0-9._-]+", normalized)
+            and lowered not in PluginFinder._INVALID_PLUGIN_LITERALS
         ):
             return normalized
 
@@ -137,6 +179,48 @@ class PluginFinder(Star):
         return [str(value)]
 
     @staticmethod
+    def _collect_string_values_only(value, *, depth: int = 0) -> list[str]:
+        if depth > 4:
+            return []
+
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+
+            collected = [text]
+            if text[:1] in {"{", "["}:
+                try:
+                    parsed = json.loads(text)
+                    collected.extend(
+                        PluginFinder._collect_string_values_only(parsed, depth=depth + 1)
+                    )
+                except Exception:
+                    pass
+            return collected
+
+        if isinstance(value, dict):
+            collected: list[str] = []
+            for item in value.values():
+                collected.extend(
+                    PluginFinder._collect_string_values_only(item, depth=depth + 1)
+                )
+            return collected
+
+        if isinstance(value, (list, tuple, set)):
+            collected: list[str] = []
+            for item in value:
+                collected.extend(
+                    PluginFinder._collect_string_values_only(item, depth=depth + 1)
+                )
+            return collected
+
+        return [str(value)]
+
+    @staticmethod
     def _extract_plugin_name_from_kwargs(kwargs: dict) -> str:
         if not kwargs:
             return ""
@@ -168,10 +252,21 @@ class PluginFinder(Star):
                 return token
 
         tokens: list[str] = []
-        for text in PluginFinder._collect_string_values(kwargs):
+        for text in PluginFinder._collect_string_values_only(kwargs):
             token = PluginFinder._extract_plugin_name_token(text)
             if token and token not in tokens:
                 tokens.append(token)
+
+        plugin_candidates = [
+            item
+            for item in tokens
+            if re.search(r"astrbot[_-]plugin[_-]", item, flags=re.IGNORECASE)
+        ]
+        if len(plugin_candidates) == 1:
+            return plugin_candidates[0]
+
+        if len(plugin_candidates) > 1:
+            return ""
 
         if len(tokens) == 1:
             return tokens[0]
@@ -204,12 +299,149 @@ class PluginFinder(Star):
                 except Exception:
                     continue
 
-            texts.extend(PluginFinder._collect_string_values(value))
+            texts.extend(PluginFinder._collect_string_values_only(value))
 
         for text in texts:
             token = PluginFinder._extract_plugin_name_token(text)
             if token:
                 return token
+
+        return ""
+
+    @staticmethod
+    def _extract_search_keyword_token(text: str) -> str:
+        raw = (text or "").strip().strip("\"'")
+        if not raw:
+            return ""
+
+        plugin_match = re.search(
+            r"(astrbot[_-]plugin[_-][A-Za-z0-9._-]+)",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if plugin_match:
+            return plugin_match.group(1)
+
+        lowered = raw.lower()
+        if lowered in PluginFinder._INVALID_SEARCH_LITERALS:
+            return ""
+
+        cleaned = re.sub(
+            r"^(?:请|麻烦|帮我|请你|bot[，,:\s]*|我想|我想要|我需要|给我|替我)+",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"(?:帮我|请你)?(?:搜索|查找|找|搜|安装|装)(?:一个|一下|下|个)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.strip(" ：:，,。.!?！？")
+        cleaned = re.sub(r"(?:的)?插件$", "", cleaned).strip()
+
+        if cleaned:
+            lowered_cleaned = cleaned.lower()
+            if lowered_cleaned not in PluginFinder._INVALID_SEARCH_LITERALS:
+                if re.fullmatch(r"[A-Za-z0-9._-]{2,64}", cleaned):
+                    return cleaned
+                if re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9._-]{1,20}", cleaned):
+                    return cleaned
+
+        if re.fullmatch(r"[A-Za-z0-9._-]{2,64}", raw):
+            return raw
+
+        if re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9._-]{1,20}", raw):
+            return raw
+
+        return ""
+
+    @staticmethod
+    def _extract_search_keyword_from_kwargs(kwargs: dict) -> str:
+        if not kwargs:
+            return ""
+
+        direct_keys = (
+            "search_keyword",
+            "keyword",
+            "query",
+            "search",
+            "plugin_keyword",
+            "plugin_name",
+            "plugin",
+            "name",
+            "searchKeyword",
+            "pluginName",
+            "q",
+            "text",
+            "content",
+        )
+
+        for key in direct_keys:
+            if key not in kwargs:
+                continue
+            token = PluginFinder._extract_search_keyword_token(str(kwargs.get(key) or ""))
+            if token:
+                return token
+
+        candidates: list[str] = []
+        for text in PluginFinder._collect_string_values_only(kwargs):
+            token = PluginFinder._extract_search_keyword_token(text)
+            if token and token.lower() not in PluginFinder._INVALID_SEARCH_LITERALS:
+                if token not in candidates:
+                    candidates.append(token)
+
+        if not candidates:
+            return ""
+
+        plugin_candidates = [
+            item
+            for item in candidates
+            if re.search(r"astrbot[_-]plugin[_-]", item, flags=re.IGNORECASE)
+        ]
+        if plugin_candidates:
+            return plugin_candidates[0]
+
+        return candidates[0]
+
+    @staticmethod
+    def _extract_search_keyword_from_event(event: AstrMessageEvent) -> str:
+        possible_attrs = (
+            "message_str",
+            "message",
+            "raw_message",
+            "content",
+            "text",
+        )
+
+        texts: list[str] = []
+        for attr in possible_attrs:
+            try:
+                value = getattr(event, attr, None)
+            except Exception:
+                continue
+
+            if value is None:
+                continue
+
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+
+            texts.extend(PluginFinder._collect_string_values_only(value))
+
+        for text in texts:
+            plugin_token = PluginFinder._extract_plugin_name_token(text)
+            if plugin_token:
+                return plugin_token
+
+        for text in texts:
+            keyword = PluginFinder._extract_search_keyword_token(text)
+            if keyword:
+                return keyword
 
         return ""
 
@@ -242,10 +474,10 @@ class PluginFinder(Star):
         """搜索官方市场插件，返回精简候选列表（含安装所需 plugin_name）。"""
         try:
             if not (search_keyword or "").strip() and kwargs:
-                search_keyword = self._pick_first_non_empty(
-                    kwargs,
-                    ("keyword", "query", "search", "plugin_keyword", "name"),
-                )
+                search_keyword = self._extract_search_keyword_from_kwargs(kwargs)
+
+            if not (search_keyword or "").strip():
+                search_keyword = self._extract_search_keyword_from_event(event)
 
             if not (search_keyword or "").strip():
                 return "[SEARCH_FAIL] 搜索关键词为空，请先告诉我你想找什么功能的插件。"
