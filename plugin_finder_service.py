@@ -35,6 +35,9 @@ class PluginFinderService:
         self.plugins_root = plugins_root
         self._install_lock = asyncio.Lock()
         self._last_install_report = "尚无安装记录。"
+        self._last_search_plugin_names: list[str] = []
+        self._last_search_keyword = ""
+        self._last_search_at: datetime | None = None
 
     @property
     def direct_install_confirm_phrase(self) -> str:
@@ -53,6 +56,17 @@ class PluginFinderService:
     @staticmethod
     def _save_report(report_lines: list[str]) -> str:
         return "\n".join(report_lines)
+
+    @staticmethod
+    def _dedupe_keep_order(items: list[str]) -> list[str]:
+        seen = set()
+        result: list[str] = []
+        for item in items:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
 
     def _save_and_return(self, report_lines: list[str], message: str) -> str:
         self._last_install_report = self._save_report(report_lines)
@@ -116,6 +130,9 @@ class PluginFinderService:
     async def search_plugins(self, search_keyword: str) -> list[dict]:
         search_keyword = (search_keyword or "").strip()
         if not search_keyword:
+            self._last_search_plugin_names = []
+            self._last_search_keyword = ""
+            self._last_search_at = None
             return []
 
         plugins = await self._fetch_market_plugins()
@@ -138,7 +155,32 @@ class PluginFinderService:
                     }
                 )
 
-        return results[:5]
+        top_results = results[:5]
+        self._last_search_plugin_names = self._dedupe_keep_order(
+            [str(item.get("plugin_name") or "").strip() for item in top_results]
+        )
+        self._last_search_keyword = search_keyword
+        self._last_search_at = datetime.now()
+        return top_results
+
+    def _infer_plugin_name_from_recent_search(self) -> tuple[str, str]:
+        if not self._last_search_plugin_names or self._last_search_at is None:
+            return "", "[INSTALL_FAIL] 插件名为空，且无可用的最近搜索记录。请先执行搜索并提供完整 plugin_name。"
+
+        age_seconds = (datetime.now() - self._last_search_at).total_seconds()
+        if age_seconds > 600:
+            return "", "[INSTALL_FAIL] 插件名为空，且最近搜索记录已过期。请重新搜索后再安装。"
+
+        if len(self._last_search_plugin_names) == 1:
+            return self._last_search_plugin_names[0], ""
+
+        candidates = ", ".join(self._last_search_plugin_names[:5])
+        return (
+            "",
+            "[INSTALL_BLOCKED] 插件名为空，最近搜索包含多个候选，无法自动判定。"
+            "\n请使用 search 返回的完整 plugin_name。"
+            f"\n候选: {candidates}",
+        )
 
     async def _run_cmd(
         self,
@@ -1019,7 +1061,16 @@ class PluginFinderService:
     ) -> str:
         plugin_name = (plugin_name or "").strip()
         if not plugin_name:
-            return "[INSTALL_FAIL] 插件名为空，请提供 search 返回的完整 plugin_name。"
+            inferred_name, inferred_error = self._infer_plugin_name_from_recent_search()
+            if not inferred_name:
+                return inferred_error
+
+            plugin_name = inferred_name
+            await event.send(
+                event.plain_result(
+                    f"ℹ 未收到 plugin_name，已根据最近搜索结果自动选择：{plugin_name}"
+                )
+            )
 
         if not has_user_confirmed:
             report_lines = [

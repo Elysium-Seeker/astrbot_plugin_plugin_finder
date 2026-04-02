@@ -25,17 +25,42 @@ try {
         $prepareArgs += @("--change", $item)
     }
 
-    & $python @prepareArgs
+    $prepareOutput = & $python @prepareArgs
+    if ($prepareOutput) {
+        $prepareOutput | ForEach-Object { Write-Output $_ }
+    }
     if ($LASTEXITCODE -ne 0) {
-        throw "release_prepare.py 执行失败。"
+        throw "release_prepare.py failed"
     }
 
-    $version = (& $python -c "import pathlib, re; t=pathlib.Path('metadata.yaml').read_text(encoding='utf-8'); m=re.search(r'^version:\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$', t, re.M); print(m.group(1) if m else '')").Trim()
+    $version = ""
+    foreach ($line in $prepareOutput) {
+        if ($line -match '^release_prepared v([0-9]+\.[0-9]+\.[0-9]+)$') {
+            $version = $Matches[1]
+            break
+        }
+    }
+
     if (-not $version) {
-        throw "无法从 metadata.yaml 读取版本号。"
+        foreach ($line in Get-Content "metadata.yaml") {
+            if ($line -match '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$') {
+                $version = $Matches[1]
+                break
+            }
+        }
     }
 
-    git add main.py metadata.yaml README.md CHANGELOG.md release_prepare.py release_push.ps1
+    if (-not $version) {
+        throw "cannot parse version from metadata.yaml"
+    }
+
+    git add -A
+    git diff --cached --quiet
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "release_push_no_changes"
+        exit 0
+    }
+
     git commit -m "chore(release): v$version"
 
     $tag = "v$version"

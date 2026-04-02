@@ -19,7 +19,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.17",
+    "1.1.18",
 )
 class PluginFinder(Star):
     def __init__(self, context: Context, config=None):
@@ -61,6 +61,7 @@ class PluginFinder(Star):
         payload = {
             "total": len(results),
             "items": compact_items,
+            "install_hint": "安装时必须传 plugin_name=items[].plugin_name",
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -101,7 +102,7 @@ class PluginFinder(Star):
         search_keyword: str = "",
         **kwargs,
     ):
-        """搜索官方市场插件，返回精简候选列表。"""
+        """搜索官方市场插件，返回精简候选列表（含安装所需 plugin_name）。"""
         try:
             if not (search_keyword or "").strip() and kwargs:
                 search_keyword = self._pick_first_non_empty(
@@ -131,7 +132,7 @@ class PluginFinder(Star):
         has_user_confirmed=False,
         **kwargs,
     ):
-        """用户明确确认后执行安装；未确认时 has_user_confirmed 必须为 False。"""
+        """用户明确确认后执行安装；必须传 plugin_name，未确认时 has_user_confirmed 必须为 False。"""
         try:
             if not (plugin_name or "").strip() and kwargs:
                 plugin_name = self._pick_first_non_empty(

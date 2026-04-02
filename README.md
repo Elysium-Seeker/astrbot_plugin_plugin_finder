@@ -13,6 +13,8 @@
 
 ## 🆕 最近更新
 
+- `v1.1.18`：修复安装阶段 plugin_name 为空时的兜底逻辑：支持最近搜索唯一候选自动补全；多候选场景改为 INSTALL_BLOCKED 并返回候选列表，避免误装；发布脚本改为 git add -A，避免代码改动漏提交；修复 release_push.ps1 在 PowerShell 下的版本解析稳定性。
+
 - `v1.1.17`：新增发布准备脚本：自动同步 metadata.yaml 与 main.py 版本，确保 AstrBot 可识别更新；新增标准 CHANGELOG.md，并在每次发布时自动写入更新条目；新增一键发布脚本 release_push.ps1：自动提交、打 tag、推送。
 - `v1.1.16`：优化 token 消耗：`search_astrbot_plugin` 结果改为紧凑 JSON（无缩进）、仅返回前 3 个候选且描述自动截断；同时精简工具说明文本与安装日志默认回显长度。
 - `v1.1.15`：改为默认“所有插件自动安装依赖并自动重载”；安装或命中已安装后，会尝试发送本地渲染的 README 预览图片。
