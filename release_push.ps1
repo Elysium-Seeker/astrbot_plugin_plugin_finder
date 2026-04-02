@@ -54,6 +54,11 @@ try {
         throw "cannot parse version from metadata.yaml"
     }
 
+    Get-ChildItem -Path $repoRoot -Directory -Recurse -Filter "__pycache__" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
+        }
+
     git add -A
     git diff --cached --quiet
     if ($LASTEXITCODE -eq 0) {

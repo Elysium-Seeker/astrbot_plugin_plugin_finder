@@ -20,7 +20,7 @@ else:
     "astrbot_plugin_plugin_finder",
     "插件发现者",
     "支持用户使用自然语言或者命令在官方市场检索、发现、确认并自动安装、热重载 AstrBot 插件。",
-    "1.1.20",
+    "1.1.21",
 )
 class PluginFinder(Star):
     _INVALID_PLUGIN_LITERALS = {
